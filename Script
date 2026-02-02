@@ -1,0 +1,351 @@
+<#
+Apply Noname policy to ALL APIs in DEV only for specific Business Groups.
+
+Features:
+- Filters to specific Business Groups via allow-list
+- DEV-only (by environment name)
+- Idempotent: checks policies before applying (no duplicates)
+- -WhatIf support (dry run)
+- Retry/backoff for transient failures (429/5xx/timeouts)
+- CSV report output
+
+You MUST set Noname policy identifiers (groupId/assetId/assetVersion) + configurationData.
+
+USAGE EXAMPLES:
+Dry run:
+  .\Apply-Noname-Dev-SpecificBG.ps1 -ClientId "xxx" -ClientSecret "yyy" -DevEnvironmentName "Dev" `
+    -AllowedBusinessGroups @("Teller","Commercial") -WhatIf
+
+Real run:
+  .\Apply-Noname-Dev-SpecificBG.ps1 -ClientId "xxx" -ClientSecret "yyy" -DevEnvironmentName "Dev" `
+    -AllowedBusinessGroups @("Teller","Commercial")
+#>
+
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory=$true)]
+  [string] $ClientId,
+
+  [Parameter(Mandatory=$true)]
+  [string] $ClientSecret,
+
+  # Control plane URL (US default). Change if your org uses EU etc.
+  [string] $BaseUrl = "https://anypoint.mulesoft.com",
+
+  # Must match environment name exactly as shown in Anypoint (e.g., "Dev", "DEV", "Development")
+  [string] $DevEnvironmentName = "Dev",
+
+  # Only these Business Groups will be processed (by exact name). If empty -> ALL BGs.
+  [string[]] $AllowedBusinessGroups = @(),
+
+  # Optional: only apply to APIs whose instanceLabel contains this text (blank = all)
+  [string] $ApiNameContains = "",
+
+  # Dry run (no changes)
+  [switch] $WhatIf
+)
+
+# -----------------------------
+# Noname policy definition (FILL THESE)
+# -----------------------------
+# IMPORTANT:
+# Replace placeholders with real values from your tenant/policy.
+# Easiest method:
+#   1) Apply Noname once to one DEV API via UI
+#   2) GET that API's policies:
+#        GET .../apis/{apiId}/policies
+#   3) Copy the Noname policy block (groupId/assetId/assetVersion/configurationData) into this object.
+$NonamePolicy = @{
+  Name         = "noname"
+  groupId      = "<NONAME_GROUP_ID>"     # REQUIRED
+  assetId      = "<NONAME_ASSET_ID>"     # REQUIRED
+  assetVersion = "<NONAME_VERSION>"      # REQUIRED
+  order        = 1
+  configurationData = @{
+    # REQUIRED: Replace with the EXACT schema required by your Noname policy.
+    enabled = $true
+  }
+  pointcutData = $null
+}
+
+# -----------------------------
+# Utility: Retry wrapper
+# -----------------------------
+function Invoke-WithRetry {
+  param(
+    [Parameter(Mandatory=$true)]
+    [scriptblock] $Operation,
+
+    [int] $MaxAttempts = 6,
+    [int] $InitialDelaySeconds = 2
+  )
+
+  $attempt = 0
+  $delay = $InitialDelaySeconds
+
+  while ($true) {
+    try {
+      $attempt++
+      return & $Operation
+    } catch {
+      $msg = ($_.Exception.Message | Out-String).Trim()
+
+      if ($attempt -ge $MaxAttempts) {
+        throw $_
+      }
+
+      # Very common transient issues with SaaS APIs:
+      $isTransient = $msg -match "429|Too Many Requests|timeout|timed out|temporarily|503|502|504|Internal Server Error|connection"
+
+      if ($isTransient) {
+        Start-Sleep -Seconds $delay
+        $delay = [Math]::Min($delay * 2, 30)
+        continue
+      }
+
+      throw $_
+    }
+  }
+}
+
+# -----------------------------
+# Utility: JSON REST caller
+# -----------------------------
+function Invoke-AnypointJson {
+  param(
+    [Parameter(Mandatory=$true)] [string] $Method,
+    [Parameter(Mandatory=$true)] [string] $Url,
+    [Parameter(Mandatory=$true)] [string] $Token,
+    $Body = $null
+  )
+
+  $headers = @{
+    Authorization = "Bearer $Token"
+    Accept        = "application/json"
+    "Content-Type"= "application/json"
+  }
+
+  $op = {
+    if ($null -ne $Body) {
+      $json = $Body | ConvertTo-Json -Depth 60
+      Invoke-RestMethod -Method $Method -Uri $Url -Headers $headers -Body $json
+    } else {
+      Invoke-RestMethod -Method $Method -Uri $Url -Headers $headers
+    }
+  }
+
+  Invoke-WithRetry -Operation $op
+}
+
+# -----------------------------
+# OAuth token
+# -----------------------------
+function Get-BearerToken {
+  param([string]$BaseUrl,[string]$ClientId,[string]$ClientSecret)
+
+  $tokenUrl = "$BaseUrl/accounts/api/v2/oauth2/token"
+  $form = @{
+    grant_type    = "client_credentials"
+    client_id     = $ClientId
+    client_secret = $ClientSecret
+  }
+
+  $op = {
+    Invoke-RestMethod -Method POST -Uri $tokenUrl -ContentType "application/x-www-form-urlencoded" -Body $form
+  }
+
+  $resp = Invoke-WithRetry -Operation $op
+  if (-not $resp.access_token) { throw "No access_token returned from token endpoint: $tokenUrl" }
+  $resp.access_token
+}
+
+# -----------------------------
+# Discovery: Orgs (Business Groups)
+# -----------------------------
+function Get-Organizations {
+  param([string]$BaseUrl,[string]$Token)
+
+  $url = "$BaseUrl/accounts/api/organizations"
+  $resp = Invoke-AnypointJson -Method GET -Url $url -Token $Token
+
+  if ($resp.data) { return @($resp.data) }
+  if ($resp -is [array]) { return $resp }
+  return @($resp)
+}
+
+function Get-EnvironmentsForOrg {
+  param([string]$BaseUrl,[string]$Token,[string]$OrgId)
+
+  $url = "$BaseUrl/accounts/api/organizations/$OrgId/environments"
+  $resp = Invoke-AnypointJson -Method GET -Url $url -Token $Token
+
+  if ($resp.data) { return @($resp.data) }
+  if ($resp -is [array]) { return $resp }
+  return @($resp)
+}
+
+function Get-ApisForOrgEnv {
+  param([string]$BaseUrl,[string]$Token,[string]$OrgId,[string]$EnvId)
+
+  # If you have >500 APIs per env, add pagination; most orgs are under this.
+  $url = "$BaseUrl/apimanager/api/v1/organizations/$OrgId/environments/$EnvId/apis?limit=500"
+  $resp = Invoke-AnypointJson -Method GET -Url $url -Token $Token
+
+  if ($resp.data) { return @($resp.data) }
+  if ($resp -is [array]) { return $resp }
+  return @($resp)
+}
+
+function Get-AppliedPoliciesForApi {
+  param([string]$BaseUrl,[string]$Token,[string]$OrgId,[string]$EnvId,[string]$ApiId)
+
+  $url = "$BaseUrl/apimanager/api/v1/organizations/$OrgId/environments/$EnvId/apis/$ApiId/policies"
+  $resp = Invoke-AnypointJson -Method GET -Url $url -Token $Token
+
+  if ($resp.data) { return @($resp.data) }
+  if ($resp -is [array]) { return $resp }
+  return @($resp)
+}
+
+# -----------------------------
+# Core: Ensure policy (idempotent)
+# -----------------------------
+function Ensure-PolicyOnApi {
+  param(
+    [string]$BaseUrl,[string]$Token,
+    [string]$OrgId,[string]$EnvId,[string]$ApiId,
+    [hashtable]$Policy,
+    [switch]$WhatIf
+  )
+
+  $existing = Get-AppliedPoliciesForApi -BaseUrl $BaseUrl -Token $Token -OrgId $OrgId -EnvId $EnvId -ApiId $ApiId
+
+  $already = $false
+  foreach ($p in $existing) {
+    # Match by policy asset coordinates
+    if ($p.groupId -eq $Policy.groupId -and $p.assetId -eq $Policy.assetId -and $p.assetVersion -eq $Policy.assetVersion) {
+      $already = $true
+      break
+    }
+  }
+
+  if ($already) { return "exists" }
+  if ($WhatIf)  { return "whatif" }
+
+  $postUrl = "$BaseUrl/apimanager/api/v1/organizations/$OrgId/environments/$EnvId/apis/$ApiId/policies"
+  $payload = @{
+    groupId           = $Policy.groupId
+    assetId           = $Policy.assetId
+    assetVersion      = $Policy.assetVersion
+    order             = $Policy.order
+    configurationData = $Policy.configurationData
+    pointcutData      = $Policy.pointcutData
+  }
+
+  [void](Invoke-AnypointJson -Method POST -Url $postUrl -Token $Token -Body $payload)
+  "applied"
+}
+
+# -----------------------------
+# Safety checks (misconfiguration prevention)
+# -----------------------------
+function Assert-PolicyConfigured {
+  param([hashtable]$Policy,[switch]$WhatIf)
+
+  $placeholders =
+    ($Policy.groupId -like "<*") -or
+    ($Policy.assetId -like "<*") -or
+    ($Policy.assetVersion -like "<*")
+
+  if ($placeholders) {
+    Write-Warning "Noname policy coordinates are placeholders. Replace groupId/assetId/assetVersion before real run."
+    if (-not $WhatIf) {
+      throw "Stopping to prevent accidental run with placeholder policy identifiers. Use -WhatIf or fill NonamePolicy."
+    }
+  }
+
+  if ($null -eq $Policy.configurationData -or $Policy.configurationData.Keys.Count -eq 0) {
+    Write-Warning "configurationData is empty. Many policies require config. Ensure Noname configurationData is correct."
+    if (-not $WhatIf) {
+      throw "Stopping because configurationData is empty."
+    }
+  }
+}
+
+# -----------------------------
+# MAIN
+# -----------------------------
+Assert-PolicyConfigured -Policy $NonamePolicy -WhatIf:$WhatIf
+
+$token = Get-BearerToken -BaseUrl $BaseUrl -ClientId $ClientId -ClientSecret $ClientSecret
+Write-Host "Token acquired."
+
+$report = New-Object System.Collections.Generic.List[object]
+
+$orgs = Get-Organizations -BaseUrl $BaseUrl -Token $token
+Write-Host "Business Groups discovered: $($orgs.Count)"
+
+foreach ($org in $orgs) {
+  $orgId = $org.id
+  $orgName = $org.name
+
+  # Allow-list filter
+  if ($AllowedBusinessGroups.Count -gt 0 -and ($AllowedBusinessGroups -notcontains $orgName)) {
+    Write-Host "Skipping Business Group: $orgName"
+    continue
+  }
+
+  Write-Host "=== Processing Business Group: $orgName ($orgId) ==="
+
+  $envs = Get-EnvironmentsForOrg -BaseUrl $BaseUrl -Token $token -OrgId $orgId
+  $devEnv = $envs | Where-Object { $_.name -eq $DevEnvironmentName } | Select-Object -First 1
+
+  if (-not $devEnv) {
+    Write-Host "  - Dev env '$DevEnvironmentName' not found in this BG. Skipping."
+    continue
+  }
+
+  $envId = $devEnv.id
+  Write-Host "-- Environment: $($devEnv.name) ($envId)"
+
+  $apis = Get-ApisForOrgEnv -BaseUrl $BaseUrl -Token $token -OrgId $orgId -EnvId $envId
+
+  if ($ApiNameContains) {
+    $apis = $apis | Where-Object { ($_.instanceLabel -as [string]) -like "*$ApiNameContains*" }
+  }
+
+  Write-Host "   APIs found in Dev: $($apis.Count)"
+
+  foreach ($api in $apis) {
+    $apiId = $api.id
+    $apiLabel = $api.instanceLabel
+
+    $status = "error"
+    $errorMsg = ""
+
+    try {
+      $status = Ensure-PolicyOnApi -BaseUrl $BaseUrl -Token $token -OrgId $orgId -EnvId $envId -ApiId $apiId -Policy $NonamePolicy -WhatIf:$WhatIf
+      Write-Host ("   > {0} ({1}) : {2}" -f $apiLabel, $apiId, $status)
+    } catch {
+      $errorMsg = ($_.Exception.Message | Out-String).Trim()
+      Write-Host ("   > {0} ({1}) : ERROR - {2}" -f $apiLabel, $apiId, $errorMsg)
+    }
+
+    $report.Add([pscustomobject]@{
+      timestamp     = (Get-Date).ToString("s")
+      businessGroup = $orgName
+      orgId         = $orgId
+      environment   = $devEnv.name
+      envId         = $envId
+      apiLabel      = $apiLabel
+      apiId         = $apiId
+      policy        = $NonamePolicy.Name
+      result        = $status
+      error         = $errorMsg
+    })
+  }
+}
+
+$csvPath = Join-Path (Get-Location) ("noname_policy_dev_{0}.csv" -f (Get-Date).ToString("yyyyMMdd_HHmmss"))
+$report | Export-Csv -NoTypeInformation -Path $csvPath
+Write-Host "Done. Report written to: $csvPath"

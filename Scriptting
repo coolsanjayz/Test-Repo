@@ -1,0 +1,50 @@
+# -------------------------
+# INPUTS (fill these)
+# -------------------------
+$BaseUrl      = "https://anypoint.mulesoft.com"
+$ClientId     = "<CLIENT_ID>"
+$ClientSecret = "<CLIENT_SECRET>"
+
+# IDs for the specific API (Dev)
+$OrgId = "<ORG_ID>"          # Business Group orgId
+$EnvId = "<DEV_ENV_ID>"      # Dev environment id
+$ApiId = "<API_INSTANCE_ID>" # API instance id in API Manager
+
+# -------------------------
+# STEP 1: Get Bearer Token
+# -------------------------
+$tokenResponse = Invoke-RestMethod `
+  -Method POST `
+  -Uri "$BaseUrl/accounts/api/v2/oauth2/token" `
+  -ContentType "application/x-www-form-urlencoded" `
+  -Body @{
+    grant_type    = "client_credentials"
+    client_id     = $ClientId
+    client_secret = $ClientSecret
+  }
+
+$AccessToken = $tokenResponse.access_token
+
+if (-not $AccessToken) {
+  throw "Failed to obtain access token"
+}
+
+Write-Host "Bearer token acquired."
+
+# -------------------------
+# STEP 2: Get policies for the API
+# -------------------------
+$headers = @{
+  Authorization = "Bearer $AccessToken"
+  Accept        = "application/json"
+}
+
+$policiesResponse = Invoke-RestMethod `
+  -Method GET `
+  -Uri "$BaseUrl/apimanager/api/v1/organizations/$OrgId/environments/$EnvId/apis/$ApiId/policies" `
+  -Headers $headers
+
+# -------------------------
+# OUTPUT (pretty JSON)
+# -------------------------
+$policiesResponse | ConvertTo-Json -Depth 100

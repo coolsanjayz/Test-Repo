@@ -1,0 +1,332 @@
+<#
+Dev_RemoveAutoNoname_ApplyInstanceNoname.ps1
+
+What it does (Dev only):
+1) Deletes the Automated Noname policy rule (auto-detects the correct DELETE endpoint)
+2) Applies the same Noname policy as an INSTANCE policy to every API in the Dev environment (idempotent)
+3) Writes a CSV report
+
+SECURITY:
+- Do NOT hardcode SOURCE_KEY. Set it as an environment variable NONAME_SOURCE_KEY (or pass via Azure DevOps secret var).
+#>
+
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory=$true)] [string] $ClientId,
+  [Parameter(Mandatory=$true)] [string] $ClientSecret,
+
+  # US control plane (change only if you are on EU/Gov)
+  [string] $BaseUrl = "https://anypoint.mulesoft.com",
+
+  # From your screenshot
+  [string] $OrgId    = "8037810c-cedf-4e2d-bf6c-0ab43ead81af",
+  [string] $DevEnvId = "784f1317-7020-4a5e-9912-0b1fb9736500",
+
+  # From your screenshot (automatedPolicies[].id)
+  [int] $AutomatedNonameRuleId = 131886,
+
+  # Optional filter (empty = all APIs)
+  [string] $ApiNameContains = "",
+
+  # SAFETY: if enabled, script aborts if automated delete does not succeed
+  [switch] $RequireDeleteSuccess,
+
+  # Dry run (prints actions, no changes)
+  [switch] $WhatIf
+)
+
+# -------------------------
+# Helpers
+# -------------------------
+function Invoke-WithRetry {
+  param(
+    [Parameter(Mandatory=$true)][scriptblock]$Operation,
+    [int]$MaxAttempts = 6,
+    [int]$InitialDelaySeconds = 2
+  )
+  $attempt = 0
+  $delay = $InitialDelaySeconds
+
+  while ($true) {
+    try {
+      $attempt++
+      return & $Operation
+    }
+    catch {
+      if ($attempt -ge $MaxAttempts) { throw }
+      Start-Sleep -Seconds $delay
+      $delay = [Math]::Min($delay * 2, 30)
+    }
+  }
+}
+
+function Get-BearerToken {
+  param([string]$BaseUrl,[string]$ClientId,[string]$ClientSecret)
+
+  $op = {
+    Invoke-RestMethod -Method POST `
+      -Uri "$BaseUrl/accounts/api/v2/oauth2/token" `
+      -ContentType "application/x-www-form-urlencoded" `
+      -Body @{
+        grant_type="client_credentials"
+        client_id=$ClientId
+        client_secret=$ClientSecret
+      }
+  }
+
+  $resp = Invoke-WithRetry -Operation $op
+  if (-not $resp.access_token) { throw "Failed to obtain access token (no access_token in response)." }
+  return $resp.access_token
+}
+
+function Invoke-AnypointJson {
+  param(
+    [Parameter(Mandatory=$true)][string]$Method,
+    [Parameter(Mandatory=$true)][string]$Url,
+    [Parameter(Mandatory=$true)][string]$Token,
+    $Body = $null
+  )
+
+  $headers = @{
+    Authorization = "Bearer $Token"
+    Accept        = "application/json"
+    "Content-Type"= "application/json"
+  }
+
+  $op = {
+    if ($null -ne $Body) {
+      $json = $Body | ConvertTo-Json -Depth 120
+      Invoke-RestMethod -Method $Method -Uri $Url -Headers $headers -Body $json
+    } else {
+      Invoke-RestMethod -Method $Method -Uri $Url -Headers $headers
+    }
+  }
+
+  Invoke-WithRetry -Operation $op
+}
+
+function Get-HttpStatusCodeFromException {
+  param($Ex)
+  try {
+    if ($Ex.Response -and $Ex.Response.StatusCode) { return [int]$Ex.Response.StatusCode.value__ }
+  } catch {}
+  return $null
+}
+
+function Remove-AutomatedPolicyAutoDetect {
+  param(
+    [Parameter(Mandatory=$true)][string] $BaseUrl,
+    [Parameter(Mandatory=$true)][string] $Token,
+    [Parameter(Mandatory=$true)][string] $OrgId,
+    [Parameter(Mandatory=$true)][string] $EnvId,
+    [Parameter(Mandatory=$true)][int]    $RuleId,
+    [switch] $WhatIf
+  )
+
+  # Common endpoint patterns observed across tenants.
+  # We try each until one succeeds.
+  $candidates = @(
+    "$BaseUrl/apimanager/api/v1/organizations/$OrgId/automated-policies/$RuleId",
+    "$BaseUrl/apimanager/api/v1/organizations/$OrgId/automatedPolicies/$RuleId",
+    "$BaseUrl/apimanager/api/v1/organizations/$OrgId/environments/$EnvId/automated-policies/$RuleId",
+    "$BaseUrl/apimanager/api/v1/organizations/$OrgId/environments/$EnvId/automatedPolicies/$RuleId",
+
+    # Some tenants put automated policies under a different API root
+    "$BaseUrl/apimanager/xapi/v1/organizations/$OrgId/automated-policies/$RuleId",
+    "$BaseUrl/apimanager/xapi/v1/organizations/$OrgId/environments/$EnvId/automated-policies/$RuleId"
+  )
+
+  foreach ($url in $candidates) {
+    Write-Host "Trying DELETE $url"
+
+    if ($WhatIf) {
+      Write-Host "[WhatIf] Would DELETE via $url"
+      return @{ Success = $true; Url = $url }
+    }
+
+    try {
+      Invoke-AnypointJson -Method DELETE -Url $url -Token $Token | Out-Null
+      Write-Host "✅ Deleted automated policy using: $url"
+      return @{ Success = $true; Url = $url }
+    }
+    catch {
+      $code = Get-HttpStatusCodeFromException -Ex $_.Exception
+      if ($code -in @(401,403)) {
+        throw "Permission error ($code) while calling $url. Check Connected App permissions for API Manager."
+      }
+
+      # Not supported endpoint: continue probing
+      Write-Host "❌ Not supported or failed ($code): $url"
+    }
+  }
+
+  return @{ Success = $false; Url = $null }
+}
+
+# -------------------------
+# Noname INSTANCE policy payload (from your automated policy config)
+# IMPORTANT: SOURCE_KEY must come from env var
+# -------------------------
+$NonameSourceKey = $env:NONAME_SOURCE_KEY
+if (-not $NonameSourceKey) {
+  throw "Set environment variable NONAME_SOURCE_KEY before running. Example: `$env:NONAME_SOURCE_KEY = '...'"
+}
+
+$NonameInstancePolicyPayload = @{
+  groupId      = "8037810c-cedf-4e2d-bf6c-0ab43ead81af"
+  assetId      = "noname-security"
+  assetVersion = "4.0.1"
+  order        = 1
+  pointcutData = $null
+  configurationData = @{
+    "ENGINE_URL"                     = "https://wintrust.nonamesec.com/engine?structure=base64-payload"
+    "SOURCE_TYPE"                    = 1
+    "SOURCE_INDEX"                   = 55
+    "SOURCE_KEY"                     = $NonameSourceKey
+    "CONNECTION_TIMEOUT"             = 500
+    "TTL_CACHE_MAX_SIZE"             = 10000
+    "TTL_CACHE_TIMEOUT"              = 10
+    "MAX_CONNECTIONS"                = 50
+    "BATCH_SIZE"                     = 10
+    "MAX_PAYLOAD_SIZE_BYTES"         = 131072
+    "CPU_THRESHOLD"                  = 80
+    "PROXY_HOSTNAME"                 = "NO_PROXY"
+    "PROXY_PORT"                     = 3128
+    "PROXY_USERNAME"                 = "NO_PROXY_AUTHENTICATION"
+    "PROXY_PASSWORD"                 = "NO_PROXY_AUTHENTICATION"
+    "DEBUG"                          = $false
+    "PREPEND_APPNAME"                = $false
+    "VALIDATE_CERTIFICATES"          = $false
+    "SHOULD_IGNORE_REQUEST_PAYLOAD"  = $false
+    "SHOULD_IGNORE_RESPONSE_PAYLOAD" = $false
+  }
+}
+
+# -------------------------
+# MAIN
+# -------------------------
+$token = Get-BearerToken -BaseUrl $BaseUrl -ClientId $ClientId -ClientSecret $ClientSecret
+Write-Host "Bearer token acquired."
+
+$report = New-Object System.Collections.Generic.List[object]
+
+# 1) Remove Automated Noname rule (auto-detect DELETE endpoint)
+Write-Host "Deleting Automated Noname policy rule id=$AutomatedNonameRuleId (auto-detect endpoint)..."
+$deleteResult = Remove-AutomatedPolicyAutoDetect -BaseUrl $BaseUrl -Token $token -OrgId $OrgId -EnvId $DevEnvId -RuleId $AutomatedNonameRuleId -WhatIf:$WhatIf
+$autoDeleteSucceeded = [bool]$deleteResult.Success
+
+if ($autoDeleteSucceeded) {
+  $report.Add([pscustomobject]@{
+    timestamp = (Get-Date).ToString("s")
+    step      = "delete_automated_noname"
+    result    = "success"
+    endpoint  = $deleteResult.Url
+    error     = ""
+  })
+} else {
+  $report.Add([pscustomobject]@{
+    timestamp = (Get-Date).ToString("s")
+    step      = "delete_automated_noname"
+    result    = "failed"
+    endpoint  = ""
+    error     = "Could not auto-detect a working DELETE endpoint."
+  })
+}
+
+if ($RequireDeleteSuccess -and -not $autoDeleteSucceeded) {
+  throw "RequireDeleteSuccess enabled → automated Noname policy was NOT deleted. Aborting before instance policy apply."
+}
+
+# 2) List Dev APIs
+$apisUrl  = "$BaseUrl/apimanager/api/v1/organizations/$OrgId/environments/$DevEnvId/apis?limit=500"
+$apisResp = Invoke-AnypointJson -Method GET -Url $apisUrl -Token $token
+
+$apis = @()
+if ($apisResp.data) { $apis = @($apisResp.data) } else { $apis = @($apisResp) }
+
+if ($ApiNameContains) {
+  $apis = $apis | Where-Object { ($_.instanceLabel -as [string]) -like "*$ApiNameContains*" }
+}
+
+Write-Host "Dev APIs found: $($apis.Count)"
+
+# 3) Apply Noname as INSTANCE policy (idempotent)
+foreach ($api in $apis) {
+  $apiId = $api.id
+  $label = $api.instanceLabel
+
+  $status = "error"
+  $err = ""
+
+  try {
+    $polUrl  = "$BaseUrl/apimanager/api/v1/organizations/$OrgId/environments/$DevEnvId/apis/$apiId/policies"
+    $polResp = Invoke-AnypointJson -Method GET -Url $polUrl -Token $token
+
+    # Normalize response shapes
+    $existing = @()
+    if ($polResp.data) { $existing = @($polResp.data) }
+    elseif ($polResp.policies) { $existing = @($polResp.policies) }
+    else { $existing = @($polResp) }
+
+    $already = $false
+    foreach ($p in $existing) {
+      # Some responses keep GAV at top level; others inside template.
+      $g = $p.groupId; $a = $p.assetId; $v = $p.assetVersion
+      if (-not $g -and $p.template) { $g=$p.template.groupId; $a=$p.template.assetId; $v=$p.template.assetVersion }
+
+      if ($g -eq $NonameInstancePolicyPayload.groupId -and
+          $a -eq $NonameInstancePolicyPayload.assetId -and
+          $v -eq $NonameInstancePolicyPayload.assetVersion) {
+        $already = $true
+        break
+      }
+    }
+
+    if ($already) {
+      $status = "exists"
+      Write-Host "SKIP (exists): $label"
+    }
+    elseif ($WhatIf) {
+      $status = "whatif"
+      Write-Host "[WhatIf] Would APPLY instance Noname: $label"
+    }
+    else {
+      $applyUrl = "$BaseUrl/apimanager/api/v1/organizations/$OrgId/environments/$DevEnvId/apis/$apiId/policies"
+      Invoke-AnypointJson -Method POST -Url $applyUrl -Token $token -Body $NonameInstancePolicyPayload | Out-Null
+      $status = "applied"
+      Write-Host "APPLIED: $label"
+    }
+  }
+  catch {
+    $err = ($_.Exception.Message | Out-String).Trim()
+    Write-Host "ERROR: $label -> $err"
+  }
+
+  $report.Add([pscustomobject]@{
+    timestamp = (Get-Date).ToString("s")
+    step      = "apply_instance_noname"
+    apiLabel  = $label
+    apiId     = $apiId
+    result    = $status
+    error     = $err
+  })
+}
+
+# 4) Export report
+$csvPath = Join-Path (Get-Location) ("dev_noname_migration_{0}.csv" -f (Get-Date).ToString("yyyyMMdd_HHmmss"))
+$report | Export-Csv -NoTypeInformation -Path $csvPath
+Write-Host "Done. Report: $csvPath"
+
+# -------------------------
+# Usage examples
+# -------------------------
+<# 
+# Set secret once per session (or in pipeline):
+$env:NONAME_SOURCE_KEY = "xxxxx"
+
+# Dry run (safe):
+.\Dev_RemoveAutoNoname_ApplyInstanceNoname.ps1 -ClientId "xxx" -ClientSecret "yyy" -RequireDeleteSuccess -WhatIf
+
+# Real run:
+.\Dev_RemoveAutoNoname_ApplyInstanceNoname.ps1 -ClientId "xxx" -ClientSecret "yyy" -RequireDeleteSuccess
+#>

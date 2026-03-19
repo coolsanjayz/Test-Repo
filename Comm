@@ -1,0 +1,1 @@
+grep -RiE "mdm.db.host|mdm.global.host|mdm.api.port|mdm.global.port|mdm.api.host|operationalmdm" /apps/shapp

@@ -1,0 +1,57 @@
+## Getting Repo List - Filtered by branch + Export to Excel/CSV
+
+$Pat = "YOUR_PAT_HERE"
+$EncodedPat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Pat"))
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MulesoftESB"
+$OutputFile = "repo-list-mule494.csv"
+$TargetBranch = "release/mule4.9.4"
+
+$Headers = @{
+    Authorization  = "Basic $EncodedPat"
+    "Content-Type" = "application/json"
+}
+
+## Step 1: Get all repos
+$Uri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories?api-version=7.0"
+Write-Host " Fetching Repos from Azure DevOps..."
+
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $Response = Invoke-RestMethod -Uri $Uri -Headers $Headers -Method Get
+
+    $Results = @()
+
+    foreach ($Repo in $Response.value) {
+        ## Step 2: Check if the target branch exists in this repo
+        $BranchUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$($Repo.id)/refs?filter=heads/release/mule4.9.4&api-version=7.0"
+        
+        try {
+            $BranchResponse = Invoke-RestMethod -Uri $BranchUri -Headers $Headers -Method Get
+            
+            if ($BranchResponse.count -gt 0) {
+                $Results += [PSCustomObject]@{
+                    RepoName = $Repo.name
+                    RepoId   = $Repo.id
+                    CloneUrl = $Repo.remoteUrl -replace "https://[^@]+@", "https://"
+                    Branch   = $TargetBranch
+                    DefaultBranch = $Repo.defaultBranch
+                }
+                Write-Host "  FOUND: $($Repo.name)"
+            }
+        } catch {
+            ## Branch not found in this repo, skip
+        }
+    }
+
+    ## Step 3: Export to CSV (opens in Excel)
+    if ($Results.Count -gt 0) {
+        $Results | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+        Write-Host " $($Results.Count) repos with '$TargetBranch' written to $OutputFile"
+    } else {
+        Write-Warning "No repos found with branch '$TargetBranch'"
+    }
+
+} catch {
+    Write-Error "Failed to fetch repo list: $_"
+}

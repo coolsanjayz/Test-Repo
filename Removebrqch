@@ -542,6 +542,251 @@ Write-Host "Completed."
 
 
 
+# RemoveMainBranch.ps1
 
+$Pat = "YOUR_PAT"
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+$RepoListFile = ".\repo-list.txt"
+
+$MainBranch = "main"
+$ReleaseBranch = "release/mule-4.9.4"
+
+$ApiVersion = "7.0"
+
+$DryRun = $true   # change to $false when ready
+
+$EncodedPat = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes(":$Pat")
+)
+
+$Headers = @{
+    Authorization  = "Basic $EncodedPat"
+    "Content-Type" = "application/json"
+}
+
+$ZeroCommit = "0000000000000000000000000000000000000000"
+$Results = @()
+
+function Get-RepoNameFromLine {
+    param([string]$Line)
+
+    $Line = $Line.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($Line)) {
+        return $null
+    }
+
+    if ($Line.StartsWith("#")) {
+        return $null
+    }
+
+    if ($Line -match "/_git/([^/?#]+)") {
+        return $Matches[1]
+    }
+
+    return $Line
+}
+
+function Get-BranchRef {
+    param(
+        [string]$RepoId,
+        [string]$BranchName
+    )
+
+    $Filter = [uri]::EscapeDataString("heads/$BranchName")
+
+    $Uri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?filter=$Filter&api-version=$ApiVersion"
+
+    $Resp = Invoke-RestMethod `
+        -Uri $Uri `
+        -Headers $Headers `
+        -Method Get
+
+    return $Resp.value | Where-Object {
+        $_.name -eq "refs/heads/$BranchName"
+    } | Select-Object -First 1
+}
+
+function Update-Ref {
+    param(
+        [string]$RepoId,
+        [object]$BodyObject
+    )
+
+    $Uri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?api-version=$ApiVersion"
+    $Body = $BodyObject | ConvertTo-Json -Depth 10
+
+    if ($DryRun) {
+        Write-Host "DRY RUN BODY:"
+        Write-Host $Body
+        return
+    }
+
+    Invoke-RestMethod `
+        -Uri $Uri `
+        -Headers $Headers `
+        -Method Post `
+        -Body $Body | Out-Null
+}
+
+if (-not (Test-Path $RepoListFile)) {
+    Write-Error "repo-list.txt not found"
+    exit 1
+}
+
+$RepoNames = Get-Content $RepoListFile |
+ForEach-Object { Get-RepoNameFromLine $_ } |
+Where-Object { $_ } |
+Select-Object -Unique
+
+Write-Host "RepoNames loaded:"
+$RepoNames | ForEach-Object { Write-Host " - $_" }
+
+$ReposUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories?api-version=$ApiVersion"
+
+Write-Host ""
+Write-Host "Loading Azure DevOps repositories..."
+
+$AllRepos = (
+    Invoke-RestMethod `
+        -Uri $ReposUri `
+        -Headers $Headers `
+        -Method Get
+).value
+
+Write-Host "Azure Repos returned: $($AllRepos.Count)"
+
+foreach ($RepoName in $RepoNames) {
+
+    Write-Host ""
+    Write-Host "====================================="
+    Write-Host "Processing: $RepoName"
+    Write-Host "====================================="
+
+    try {
+        $Repo = $AllRepos | Where-Object {
+            $_.name -eq $RepoName
+        } | Select-Object -First 1
+
+        if (-not $Repo) {
+            Write-Warning "Repo not found: $RepoName"
+
+            $Results += [PSCustomObject]@{
+                Repo          = $RepoName
+                Status        = "SKIPPED"
+                Reason        = "Repo not found"
+                OldMainCommit = ""
+                ReleaseCommit = ""
+            }
+
+            continue
+        }
+
+        $RepoId = $Repo.id
+
+        Write-Host "RepoId: $RepoId"
+
+        $MainRef = Get-BranchRef -RepoId $RepoId -BranchName $MainBranch
+        $ReleaseRef = Get-BranchRef -RepoId $RepoId -BranchName $ReleaseBranch
+
+        if (-not $ReleaseRef) {
+            Write-Warning "release/mule-4.9.4 branch not found"
+
+            $Results += [PSCustomObject]@{
+                Repo          = $RepoName
+                Status        = "SKIPPED"
+                Reason        = "release/mule-4.9.4 branch not found"
+                OldMainCommit = ""
+                ReleaseCommit = ""
+            }
+
+            continue
+        }
+
+        $ReleaseCommit = $ReleaseRef.objectId
+
+        Write-Host "Release commit: $ReleaseCommit"
+
+        if ($MainRef) {
+            $OldMainCommit = $MainRef.objectId
+
+            Write-Host "Main exists. Old main commit: $OldMainCommit"
+            Write-Host "Deleting main first..."
+
+            $DeleteMainBody = @(
+                @{
+                    name        = "refs/heads/$MainBranch"
+                    oldObjectId = $OldMainCommit
+                    newObjectId = $ZeroCommit
+                }
+            )
+
+            Update-Ref -RepoId $RepoId -BodyObject $DeleteMainBody
+
+            Write-Host "Creating main from release/mule-4.9.4..."
+
+            $CreateMainBody = @(
+                @{
+                    name        = "refs/heads/$MainBranch"
+                    oldObjectId = $ZeroCommit
+                    newObjectId = $ReleaseCommit
+                }
+            )
+
+            Update-Ref -RepoId $RepoId -BodyObject $CreateMainBody
+
+            $Results += [PSCustomObject]@{
+                Repo          = $RepoName
+                Status        = if ($DryRun) { "DRY_RUN" } else { "SUCCESS" }
+                Reason        = "main deleted and recreated from release/mule-4.9.4"
+                OldMainCommit = $OldMainCommit
+                ReleaseCommit = $ReleaseCommit
+            }
+        }
+        else {
+            Write-Host "main branch does not exist."
+            Write-Host "Creating main directly from release/mule-4.9.4..."
+
+            $CreateMainBody = @(
+                @{
+                    name        = "refs/heads/$MainBranch"
+                    oldObjectId = $ZeroCommit
+                    newObjectId = $ReleaseCommit
+                }
+            )
+
+            Update-Ref -RepoId $RepoId -BodyObject $CreateMainBody
+
+            $Results += [PSCustomObject]@{
+                Repo          = $RepoName
+                Status        = if ($DryRun) { "DRY_RUN_CREATED_MAIN" } else { "CREATED_MAIN" }
+                Reason        = "main was missing; created from release/mule-4.9.4"
+                OldMainCommit = ""
+                ReleaseCommit = $ReleaseCommit
+            }
+        }
+    }
+    catch {
+        Write-Warning "Failed: $RepoName - $($_.Exception.Message)"
+
+        $Results += [PSCustomObject]@{
+            Repo          = $RepoName
+            Status        = "FAILED"
+            Reason        = $_.Exception.Message
+            OldMainCommit = ""
+            ReleaseCommit = ""
+        }
+    }
+}
+
+$Report = ".\remove-main-recreate-results.csv"
+$Results | Export-Csv -Path $Report -NoTypeInformation
+
+Write-Host ""
+Write-Host "Completed."
+Write-Host "Report: $Report"
 
 

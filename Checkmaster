@@ -1,0 +1,218 @@
+# Check-OneRepo-MainVsRelease.ps1
+
+```powershell
+# ==========================================================
+# Check-OneRepo-MainVsRelease.ps1
+#
+# Purpose:
+# Check whether release/mule-4.9.4 contains all history from
+# the current main branch using Git's ancestry check.
+#
+# SAFE  = release contains current main history
+# NOT SAFE = main has commits not present in release
+#
+# No changes are made to Azure DevOps.
+# No branches are created.
+# No branches are deleted.
+# No commits are created.
+# ==========================================================
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+# Change this repo name as needed
+$RepoName = "sch-b2b-bai2edi823"
+
+$MainBranch = "main"
+$ReleaseBranch = "release/mule-4.9.4"
+
+# Local temporary folder
+$WorkDir = "C:\temp\ado-branch-check"
+
+Write-Host ""
+Write-Host "================================================="
+Write-Host "Azure DevOps Branch History Validation"
+Write-Host "================================================="
+Write-Host "Repo: $RepoName"
+Write-Host ""
+
+# Create working directory if needed
+if (-not (Test-Path $WorkDir)) {
+    New-Item -ItemType Directory -Path $WorkDir | Out-Null
+}
+
+Set-Location $WorkDir
+
+$RepoUrl = "https://dev.azure.com/$Org/$Project/_git/$RepoName"
+$RepoPath = Join-Path $WorkDir $RepoName
+
+# ----------------------------------------------------------
+# Clone or refresh repository
+# ----------------------------------------------------------
+
+if (-not (Test-Path $RepoPath)) {
+
+    Write-Host "Repository not found locally."
+    Write-Host "Cloning repository..."
+    Write-Host ""
+
+    git clone $RepoUrl
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host "ERROR: Git clone failed."
+        exit 1
+    }
+}
+else {
+
+    Write-Host "Repository already exists locally."
+    Write-Host "Using existing clone."
+}
+
+Set-Location $RepoPath
+
+Write-Host ""
+Write-Host "Fetching latest branch information..."
+git fetch --all --prune
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "ERROR: git fetch failed."
+    exit 1
+}
+
+# ----------------------------------------------------------
+# Verify branches exist
+# ----------------------------------------------------------
+
+Write-Host ""
+Write-Host "Checking branch existence..."
+
+git show-ref --verify --quiet "refs/remotes/origin/$MainBranch"
+
+if ($LASTEXITCODE -ne 0) {
+
+    Write-Host ""
+    Write-Host "RESULT: MAIN_MISSING"
+    Write-Host "Branch origin/$MainBranch does not exist."
+    exit 1
+}
+
+git show-ref --verify --quiet "refs/remotes/origin/$ReleaseBranch"
+
+if ($LASTEXITCODE -ne 0) {
+
+    Write-Host ""
+    Write-Host "RESULT: RELEASE_MISSING"
+    Write-Host "Branch origin/$ReleaseBranch does not exist."
+    exit 1
+}
+
+# ----------------------------------------------------------
+# Display latest commits
+# ----------------------------------------------------------
+
+Write-Host ""
+Write-Host "================================================="
+Write-Host "Latest Commit On MAIN"
+Write-Host "================================================="
+
+git log -1 --oneline "origin/$MainBranch"
+
+Write-Host ""
+Write-Host "================================================="
+Write-Host "Latest Commit On RELEASE"
+Write-Host "================================================="
+
+git log -1 --oneline "origin/$ReleaseBranch"
+
+# ----------------------------------------------------------
+# Git ancestry check
+# ----------------------------------------------------------
+
+Write-Host ""
+Write-Host "================================================="
+Write-Host "Running Git Ancestry Check"
+Write-Host "================================================="
+Write-Host ""
+
+Write-Host "Command:"
+Write-Host "git merge-base --is-ancestor origin/$MainBranch origin/$ReleaseBranch"
+Write-Host ""
+
+git merge-base --is-ancestor `
+    "origin/$MainBranch" `
+    "origin/$ReleaseBranch"
+
+$MergeBaseExitCode = $LASTEXITCODE
+
+# ----------------------------------------------------------
+# SAFE
+# ----------------------------------------------------------
+
+if ($MergeBaseExitCode -eq 0) {
+
+    Write-Host ""
+    Write-Host "================================================="
+    Write-Host "RESULT: SAFE"
+    Write-Host "================================================="
+    Write-Host ""
+
+    Write-Host "release/mule-4.9.4 contains current main history."
+    Write-Host ""
+    Write-Host "No commits are missing from release."
+    Write-Host ""
+
+    exit 0
+}
+
+# ----------------------------------------------------------
+# NOT SAFE
+# ----------------------------------------------------------
+
+if ($MergeBaseExitCode -eq 1) {
+
+    Write-Host ""
+    Write-Host "================================================="
+    Write-Host "RESULT: NOT SAFE"
+    Write-Host "================================================="
+    Write-Host ""
+
+    Write-Host "main contains commits not present in release."
+    Write-Host ""
+
+    Write-Host "-------------------------------------------------"
+    Write-Host "Commits In MAIN But Missing From RELEASE"
+    Write-Host "-------------------------------------------------"
+    Write-Host ""
+
+    git log `
+        "origin/$ReleaseBranch..origin/$MainBranch" `
+        --oneline
+
+    Write-Host ""
+    Write-Host "-------------------------------------------------"
+    Write-Host "Commits In RELEASE But Missing From MAIN"
+    Write-Host "-------------------------------------------------"
+    Write-Host ""
+
+    git log `
+        "origin/$MainBranch..origin/$ReleaseBranch" `
+        --oneline
+
+    Write-Host ""
+
+    exit 1
+}
+
+# ----------------------------------------------------------
+# Unexpected result
+# ----------------------------------------------------------
+
+Write-Host ""
+Write-Host "ERROR: Unexpected git merge-base result."
+Write-Host "Exit code: $MergeBaseExitCode"
+
+exit 99
+```

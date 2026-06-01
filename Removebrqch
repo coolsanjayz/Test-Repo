@@ -82,3 +82,112 @@ Invoke-RestMethod -Uri $RefsUri -Headers $Headers -Method Post -Body $CreateMain
 
 Write-Host ""
 Write-Host "SUCCESS: main deleted and recreated from release/mule-4.9.4"
+
+
+
+
+
+
+
+
+
+# RemoveMainBranch.ps1
+
+$Pat = "YOUR_PAT"
+$EncodedPat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Pat"))
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+$RepoName = "sch-b2b-bai2edi823"
+
+$MainBranch = "main"
+$ReleaseBranch = "release/mule-4.9.4"
+
+$DryRun = $true   # change to $false only after dry run looks correct
+
+$Headers = @{
+    Authorization  = "Basic $EncodedPat"
+    "Content-Type" = "application/json"
+}
+
+$ZeroCommit = "0000000000000000000000000000000000000000"
+
+Write-Host "Getting repo..."
+$RepoUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoName?api-version=7.0"
+$Repo = Invoke-RestMethod -Uri $RepoUri -Headers $Headers -Method Get
+$RepoId = $Repo.id
+
+Write-Host "Repo Name: $RepoName"
+Write-Host "Repo ID:   $RepoId"
+
+$EncodedMainFilter = [uri]::EscapeDataString("heads/$MainBranch")
+$EncodedReleaseFilter = [uri]::EscapeDataString("heads/$ReleaseBranch")
+
+$MainUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?filter=$EncodedMainFilter&api-version=7.0"
+$ReleaseUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?filter=$EncodedReleaseFilter&api-version=7.0"
+
+Write-Host "Getting main branch..."
+$MainRef = Invoke-RestMethod -Uri $MainUri -Headers $Headers -Method Get
+
+Write-Host "Getting release branch..."
+$ReleaseRef = Invoke-RestMethod -Uri $ReleaseUri -Headers $Headers -Method Get
+
+if ($MainRef.count -eq 0) {
+    throw "main branch not found"
+}
+
+if ($ReleaseRef.count -eq 0) {
+    throw "release/mule-4.9.4 branch not found"
+}
+
+$OldMainCommit = $MainRef.value[0].objectId
+$ReleaseCommit = $ReleaseRef.value[0].objectId
+
+Write-Host ""
+Write-Host "Old main commit: $OldMainCommit"
+Write-Host "Release commit:  $ReleaseCommit"
+
+$RefsUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?api-version=7.0"
+
+$DeleteMainBody = @(
+    @{
+        name        = "refs/heads/$MainBranch"
+        oldObjectId = $OldMainCommit
+        newObjectId = $ZeroCommit
+    }
+) | ConvertTo-Json -Depth 10
+
+$CreateMainBody = @(
+    @{
+        name        = "refs/heads/$MainBranch"
+        oldObjectId = $ZeroCommit
+        newObjectId = $ReleaseCommit
+    }
+) | ConvertTo-Json -Depth 10
+
+if ($DryRun) {
+    Write-Host ""
+    Write-Host "DRY RUN ONLY"
+    Write-Host "Would delete main:"
+    Write-Host $DeleteMainBody
+
+    Write-Host ""
+    Write-Host "Would create new main from release/mule-4.9.4:"
+    Write-Host $CreateMainBody
+    exit
+}
+
+Write-Host ""
+Write-Host "Deleting main branch..."
+Invoke-RestMethod -Uri $RefsUri -Headers $Headers -Method Post -Body $DeleteMainBody | Out-Null
+
+Write-Host "Creating new main from release/mule-4.9.4..."
+Invoke-RestMethod -Uri $RefsUri -Headers $Headers -Method Post -Body $CreateMainBody | Out-Null
+
+Write-Host ""
+Write-Host "SUCCESS: main deleted and recreated from release/mule-4.9.4"
+
+
+
+

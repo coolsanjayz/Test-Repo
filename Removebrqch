@@ -1,0 +1,84 @@
+$Pat = "YOUR_PAT"
+$EncodedPat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Pat"))
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+$RepoName = "sch-b2b-bai2edi823"
+
+$MainBranch = "main"
+$ReleaseBranch = "release/mule-4.9.4"
+
+$DryRun = $true   # first test true, then change to false
+
+$Headers = @{
+    Authorization  = "Basic $EncodedPat"
+    "Content-Type" = "application/json"
+}
+
+$ZeroCommit = "0000000000000000000000000000000000000000"
+
+$RepoUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoName?api-version=7.0"
+$Repo = Invoke-RestMethod -Uri $RepoUri -Headers $Headers -Method Get
+$RepoId = $Repo.id
+
+$MainUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?filter=heads/$MainBranch&api-version=7.0"
+$ReleaseUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?filter=heads/$ReleaseBranch&api-version=7.0"
+
+$MainRef = Invoke-RestMethod -Uri $MainUri -Headers $Headers -Method Get
+$ReleaseRef = Invoke-RestMethod -Uri $ReleaseUri -Headers $Headers -Method Get
+
+if ($MainRef.count -eq 0) {
+    throw "main branch not found"
+}
+
+if ($ReleaseRef.count -eq 0) {
+    throw "release/mule-4.9.4 branch not found"
+}
+
+$OldMainCommit = $MainRef.value[0].objectId
+$ReleaseCommit = $ReleaseRef.value[0].objectId
+
+Write-Host "Repo: $RepoName"
+Write-Host "Old main commit: $OldMainCommit"
+Write-Host "Release commit:  $ReleaseCommit"
+
+$RefsUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?api-version=7.0"
+
+$DeleteMainBody = @(
+    @{
+        name        = "refs/heads/$MainBranch"
+        oldObjectId = $OldMainCommit
+        newObjectId = $ZeroCommit
+    }
+) | ConvertTo-Json -Depth 10
+
+$CreateMainBody = @(
+    @{
+        name        = "refs/heads/$MainBranch"
+        oldObjectId = $ZeroCommit
+        newObjectId = $ReleaseCommit
+    }
+) | ConvertTo-Json -Depth 10
+
+if ($DryRun) {
+    Write-Host ""
+    Write-Host "DRY RUN ONLY"
+    Write-Host "Would delete main:"
+    Write-Host $DeleteMainBody
+    Write-Host ""
+    Write-Host "Would recreate main from release:"
+    Write-Host $CreateMainBody
+    exit
+}
+
+Write-Host ""
+Write-Host "Deleting main branch..."
+Invoke-RestMethod -Uri $RefsUri -Headers $Headers -Method Post -Body $DeleteMainBody
+
+Write-Host ""
+Write-Host "Creating new main from release/mule-4.9.4..."
+Invoke-RestMethod -Uri $RefsUri -Headers $Headers -Method Post -Body $CreateMainBody
+
+Write-Host ""
+Write-Host "SUCCESS: main deleted and recreated from release/mule-4.9.4"

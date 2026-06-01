@@ -375,4 +375,173 @@ Write-Host "Done. Report: $Report"
 
 
 
+```powershell
+# DeleteMainCreateMainFromRelease.ps1
+
+$Pat = "YOUR_PAT"
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+$RepoListFile = ".\repo-list.txt"
+
+$MainBranch = "main"
+$ReleaseBranch = "release/mule-4.9.4"
+
+$DryRun = $true   # CHANGE TO $false TO EXECUTE
+
+$EncodedPat = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes(":$Pat")
+)
+
+$Headers = @{
+    Authorization = "Basic $EncodedPat"
+    "Content-Type" = "application/json"
+}
+
+$ZeroCommit = "0000000000000000000000000000000000000000"
+
+$ReposUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories?api-version=7.0"
+
+Write-Host "Loading Azure DevOps repositories..."
+
+$AllRepos = (
+    Invoke-RestMethod `
+        -Uri $ReposUri `
+        -Headers $Headers `
+        -Method Get
+).value
+
+$RepoNames = Get-Content $RepoListFile |
+Where-Object {
+    $_.Trim() -ne ""
+}
+
+foreach ($RepoName in $RepoNames)
+{
+    Write-Host ""
+    Write-Host "====================================="
+    Write-Host "Processing $RepoName"
+    Write-Host "====================================="
+
+    $Repo = $AllRepos | Where-Object {
+        $_.name -eq $RepoName.Trim()
+    }
+
+    if (-not $Repo)
+    {
+        Write-Warning "Repo not found: $RepoName"
+        continue
+    }
+
+    $RepoId = $Repo.id
+
+    Write-Host "RepoId: $RepoId"
+
+    $MainFilter =
+        [uri]::EscapeDataString("heads/$MainBranch")
+
+    $ReleaseFilter =
+        [uri]::EscapeDataString("heads/$ReleaseBranch")
+
+    $MainUri =
+        "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?filter=$MainFilter&api-version=7.0"
+
+    $ReleaseUri =
+        "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?filter=$ReleaseFilter&api-version=7.0"
+
+    $MainRef =
+        Invoke-RestMethod `
+            -Uri $MainUri `
+            -Headers $Headers `
+            -Method Get
+
+    $ReleaseRef =
+        Invoke-RestMethod `
+            -Uri $ReleaseUri `
+            -Headers $Headers `
+            -Method Get
+
+    if ($MainRef.count -eq 0)
+    {
+        Write-Warning "main branch not found"
+        continue
+    }
+
+    if ($ReleaseRef.count -eq 0)
+    {
+        Write-Warning "release/mule-4.9.4 branch not found"
+        continue
+    }
+
+    $OldMainCommit =
+        $MainRef.value[0].objectId
+
+    $ReleaseCommit =
+        $ReleaseRef.value[0].objectId
+
+    Write-Host "Main Commit    : $OldMainCommit"
+    Write-Host "Release Commit : $ReleaseCommit"
+
+    $RefsUri =
+        "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?api-version=7.0"
+
+    $DeleteBody = @(
+        @{
+            name        = "refs/heads/$MainBranch"
+            oldObjectId = $OldMainCommit
+            newObjectId = $ZeroCommit
+        }
+    ) | ConvertTo-Json -Depth 10
+
+    $CreateBody = @(
+        @{
+            name        = "refs/heads/$MainBranch"
+            oldObjectId = $ZeroCommit
+            newObjectId = $ReleaseCommit
+        }
+    ) | ConvertTo-Json -Depth 10
+
+    if ($DryRun)
+    {
+        Write-Host ""
+        Write-Host "DRY RUN"
+        Write-Host "Would DELETE main"
+        Write-Host $DeleteBody
+
+        Write-Host ""
+        Write-Host "Would CREATE main from release"
+        Write-Host $CreateBody
+
+        continue
+    }
+
+    Write-Host ""
+    Write-Host "Deleting main..."
+
+    Invoke-RestMethod `
+        -Uri $RefsUri `
+        -Headers $Headers `
+        -Method Post `
+        -Body $DeleteBody
+
+    Write-Host "Creating main from release..."
+
+    Invoke-RestMethod `
+        -Uri $RefsUri `
+        -Headers $Headers `
+        -Method Post `
+        -Body $CreateBody
+
+    Write-Host "SUCCESS"
+}
+
+Write-Host ""
+Write-Host "Completed."
+```
+
+
+
+
+
 

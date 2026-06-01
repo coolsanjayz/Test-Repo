@@ -113,3 +113,38 @@ Write-Host "Errors:                " `
 
 Write-Host ""
 Write-Host "CSV generated: $OutputFile"
+
+
+
+
+
+catch {
+
+    Write-Host ""
+    Write-Host "======================================"
+    Write-Host "Repo: $($Repo.name)"
+    Write-Host "======================================"
+
+    Write-Host $_.Exception.Message
+
+    try {
+        $reader = New-Object System.IO.StreamReader(
+            $_.Exception.Response.GetResponseStream()
+        )
+
+        $responseBody = $reader.ReadToEnd()
+
+        Write-Host ""
+        Write-Host "Azure DevOps Response:"
+        Write-Host $responseBody
+    }
+    catch {
+        Write-Host "Could not retrieve response body."
+    }
+
+    break
+}
+
+
+
+

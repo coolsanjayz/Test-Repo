@@ -130,7 +130,7 @@ catch {
     try {
         $reader = New-Object System.IO.StreamReader(
             $_.Exception.Response.GetResponseStream()
-        )
+        ) is
 
         $responseBody = $reader.ReadToEnd()
 
@@ -147,4 +147,180 @@ catch {
 
 
 
+
+
+
+
+# CheckMainCommit.ps1
+
+$Pat = "YOUR_PAT"
+$EncodedPat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Pat"))
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+$MainBranch = "main"
+$TargetBranch = "release/mule-4.9.4"
+
+$OutputFile = "release-branch-from-main-check.csv"
+
+# Optional: test only one repo first
+$TestRepoOnly = "exp-d3-dpintradaytrans"
+# $TestRepoOnly = ""
+
+$Headers = @{
+    Authorization  = "Basic $EncodedPat"
+    "Content-Type" = "application/json"
+}
+
+$Results = @()
+
+$RepoUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories?api-version=7.0"
+
+Write-Host "Fetching repositories..."
+$Response = Invoke-RestMethod -Uri $RepoUri -Headers $Headers -Method Get
+
+foreach ($Repo in $Response.value) {
+
+    if ($TestRepoOnly -ne "" -and $Repo.name -ne $TestRepoOnly) {
+        continue
+    }
+
+    Write-Host ""
+    Write-Host "Checking: $($Repo.name)"
+
+    try {
+        $EncodedMainFilter = [uri]::EscapeDataString("heads/$MainBranch")
+        $EncodedReleaseFilter = [uri]::EscapeDataString("heads/$TargetBranch")
+
+        $MainUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$($Repo.id)/refs?filter=$EncodedMainFilter&api-version=7.0"
+        $ReleaseUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$($Repo.id)/refs?filter=$EncodedReleaseFilter&api-version=7.0"
+
+        $MainResponse = Invoke-RestMethod -Uri $MainUri -Headers $Headers -Method Get
+        $ReleaseResponse = Invoke-RestMethod -Uri $ReleaseUri -Headers $Headers -Method Get
+
+        if ($MainResponse.count -eq 0) {
+            Write-Warning "main branch missing"
+
+            $Results += [PSCustomObject]@{
+                RepoName      = $Repo.name
+                Status        = "MAIN_MISSING"
+                Reason        = "main branch not found"
+                MainCommit    = ""
+                ReleaseCommit = ""
+            }
+
+            continue
+        }
+
+        if ($ReleaseResponse.count -eq 0) {
+            Write-Warning "release branch missing"
+
+            $Results += [PSCustomObject]@{
+                RepoName      = $Repo.name
+                Status        = "RELEASE_MISSING"
+                Reason        = "release/mule-4.9.4 branch not found"
+                MainCommit    = $MainResponse.value[0].objectId
+                ReleaseCommit = ""
+            }
+
+            continue
+        }
+
+        $MainCommit = $MainResponse.value[0].objectId
+        $ReleaseCommit = $ReleaseResponse.value[0].objectId
+
+        Write-Host "Main HEAD:    $MainCommit"
+        Write-Host "Release HEAD: $ReleaseCommit"
+
+        $CommitBatchUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$($Repo.id)/commitsbatch?api-version=7.0"
+
+        $BodyObject = @{
+            itemVersion = @{
+                versionType = "branch"
+                version     = $TargetBranch
+            }
+            ids = @($MainCommit)
+        }
+
+        $Body = $BodyObject | ConvertTo-Json -Depth 10
+
+        Write-Host "Calling commitsbatch..."
+
+        $CheckResponse = Invoke-RestMethod `
+            -Uri $CommitBatchUri `
+            -Headers $Headers `
+            -Method Post `
+            -Body $Body
+
+        if ($CheckResponse.count -gt 0) {
+            $Status = "YES_RELEASE_CONTAINS_MAIN_HEAD"
+            $Reason = "release/mule-4.9.4 contains current main HEAD"
+        }
+        else {
+            $Status = "NO_MAIN_AHEAD_OR_DIFFERENT_HISTORY"
+            $Reason = "release/mule-4.9.4 does not contain current main HEAD"
+        }
+
+        Write-Host "$Status - $Reason"
+
+        $Results += [PSCustomObject]@{
+            RepoName      = $Repo.name
+            Status        = $Status
+            Reason        = $Reason
+            MainCommit    = $MainCommit
+            ReleaseCommit = $ReleaseCommit
+        }
+    }
+    catch {
+        Write-Host ""
+        Write-Host "======================================"
+        Write-Host "ERROR DETAILS"
+        Write-Host "Repo: $($Repo.name)"
+        Write-Host "======================================"
+        Write-Host $_.Exception.Message
+
+        $AzureErrorBody = ""
+
+        try {
+            $reader = New-Object System.IO.StreamReader(
+                $_.Exception.Response.GetResponseStream()
+            )
+
+            $AzureErrorBody = $reader.ReadToEnd()
+
+            Write-Host ""
+            Write-Host "Azure DevOps Response Body:"
+            Write-Host $AzureErrorBody
+        }
+        catch {
+            Write-Host "Could not read Azure DevOps response body."
+        }
+
+        $Results += [PSCustomObject]@{
+            RepoName      = $Repo.name
+            Status        = "ERROR"
+            Reason        = $_.Exception.Message
+            AzureResponse = $AzureErrorBody
+            MainCommit    = ""
+            ReleaseCommit = ""
+        }
+
+        break
+    }
+}
+
+$Results | Export-Csv -Path $OutputFile -NoTypeInformation
+
+Write-Host ""
+Write-Host "==============================="
+Write-Host "SUMMARY"
+Write-Host "==============================="
+Write-Host "YES release contains main HEAD: " (($Results | Where-Object { $_.Status -eq "YES_RELEASE_CONTAINS_MAIN_HEAD" }).Count)
+Write-Host "NO / main ahead or different:   " (($Results | Where-Object { $_.Status -eq "NO_MAIN_AHEAD_OR_DIFFERENT_HISTORY" }).Count)
+Write-Host "Release missing:                " (($Results | Where-Object { $_.Status -eq "RELEASE_MISSING" }).Count)
+Write-Host "Main missing:                   " (($Results | Where-Object { $_.Status -eq "MAIN_MISSING" }).Count)
+Write-Host "Errors:                         " (($Results | Where-Object { $_.Status -eq "ERROR" }).Count)
+Write-Host ""
+Write-Host "CSV generated: $OutputFile"
 

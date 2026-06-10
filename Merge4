@@ -1,0 +1,39 @@
+$envName = "$(env)"
+$buildNumber = "$(Build.BuildNumber)"
+$commitHash = "$(Build.SourceVersion)"
+$targetBranch = "develop"
+
+git config --global user.email "azuredevops@wintrust.com"
+git config --global user.name "Azure DevOps Release"
+
+$repoUrl = "https://$(System.AccessToken)@dev.azure.com/WTFC-DataManagement/CODE-MulesoftESB/_git/$(Build.Repository.Name)"
+
+Write-Host "Repo URL: $repoUrl"
+Write-Host "Environment: $envName"
+Write-Host "Build Number: $buildNumber"
+Write-Host "Commit Hash: $commitHash"
+
+git clone $repoUrl repo
+cd repo
+
+git fetch --all --tags
+
+Write-Host "Tags on commit:"
+git tag --points-at $commitHash
+
+$tagName = git tag --points-at $commitHash | Where-Object {
+    $_ -match "(?i)^$envName[_-]$buildNumber[_-].*"
+} | Select-Object -First 1
+
+if ([string]::IsNullOrWhiteSpace($tagName)) {
+    throw "Tag not found for commit $commitHash with env $envName and build $buildNumber"
+}
+
+Write-Host "Using tag: $tagName"
+
+git checkout $targetBranch
+git pull origin $targetBranch
+
+git merge "refs/tags/$tagName" --no-edit
+
+git push origin $targetBranch

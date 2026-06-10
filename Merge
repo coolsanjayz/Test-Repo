@@ -1,0 +1,33 @@
+$envName = "$(env)"
+$buildNumber = "$(Build.BuildNumber)"
+$commitHash = "$(Build.SourceVersion)"
+$targetBranch = "develop"
+
+git config --global user.email "azuredevops@wintrust.com"
+git config --global user.name "Azure DevOps Release"
+
+$repoUrl = "https://$(System.AccessToken)@dev.azure.com/WTFC-DataManagement/CODE-MulesoftESB/_git/$(Build.Repository.Name)"
+
+git clone $repoUrl repo
+cd repo
+
+git fetch --all --tags
+
+$prodTag = git tag --points-at $commitHash | Where-Object {
+    $_ -like "$envName-$buildNumber-*"
+} | Select-Object -First 1
+
+if ([string]::IsNullOrWhiteSpace($prodTag)) {
+    Write-Host "Tags on commit:"
+    git tag --points-at $commitHash
+    throw "PROD tag not found for commit $commitHash with pattern $envName-$buildNumber-*"
+}
+
+Write-Host "Using PROD tag: $prodTag"
+
+git checkout develop
+git pull origin develop
+
+git merge "refs/tags/$prodTag" --no-edit
+
+git push origin develop

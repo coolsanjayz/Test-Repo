@@ -1,0 +1,33 @@
+$envName = "$(env)"
+$buildNumber = "$(Build.BuildNumber)"
+$commitHash = "$(Build.SourceVersion)"
+$targetBranch = "develop"
+
+git config --global user.email "azuredevops@company.com"
+git config --global user.name "Azure DevOps Release"
+
+git fetch --all --tags
+
+Write-Host "Environment: $envName"
+Write-Host "Build Number: $buildNumber"
+Write-Host "Commit Hash: $commitHash"
+
+Write-Host "Tags on commit:"
+git tag --points-at $commitHash
+
+$tagName = git tag --points-at $commitHash | Where-Object {
+    $_ -match "(?i)^$envName[_-]$buildNumber[_-].*"
+} | Select-Object -First 1
+
+if ([string]::IsNullOrWhiteSpace($tagName)) {
+    throw "Tag not found for commit $commitHash with env $envName and build $buildNumber"
+}
+
+Write-Host "Using tag: $tagName"
+
+git checkout develop
+git pull origin develop
+
+git merge "refs/tags/$tagName" --no-edit
+
+git push origin develop

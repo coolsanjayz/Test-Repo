@@ -1,0 +1,51 @@
+$envName = "$(env)"
+$buildNumber = "$(Build.BuildNumber)"
+$commitHash = "$(Build.SourceVersion)"
+$targetBranch = "develop"
+
+git config --global user.email "azuredevops@wintrust.com"
+git config --global user.name "Azure DevOps Release"
+
+$repoUrl = "https://$(System.AccessToken)@dev.azure.com/WTFC-DataManagement/CODE-MulesoftESB/_git/$(Build.Repository.Name)"
+
+Write-Host "Environment: $envName"
+Write-Host "Build Number: $buildNumber"
+Write-Host "Commit Hash: $commitHash"
+Write-Host "Target Branch: $targetBranch"
+
+git clone $repoUrl repo
+cd repo
+
+git fetch --all --tags
+
+Write-Host "Tags on deployed commit:"
+git tag --points-at $commitHash
+
+$tagName = git tag --points-at $commitHash | Where-Object {
+    $_ -match "(?i)^$envName[_-]$buildNumber[_-].*"
+} | Sort-Object -Descending | Select-Object -First 1
+
+if ([string]::IsNullOrWhiteSpace($tagName)) {
+    throw "Deployment tag not found for commit $commitHash with env $envName and build $buildNumber"
+}
+
+Write-Host "Using deployment tag: $tagName"
+Write-Host "Syncing deployed tag code into $targetBranch"
+
+git checkout $targetBranch
+git pull origin $targetBranch
+
+git checkout "refs/tags/$tagName" -- .
+
+git add -A
+
+$changes = git status --porcelain
+
+if ([string]::IsNullOrWhiteSpace($changes)) {
+    Write-Host "$targetBranch already matches deployed tag code. No commit needed."
+}
+else {
+    git commit -m "Sync $targetBranch with deployed $envName tag $tagName"
+    git push origin $targetBranch
+    Write-Host "Successfully synced $targetBranch with deployed tag $tagName"
+}

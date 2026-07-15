@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+
+DR_DIR="./DR"
+PROD_DIR="./Prod"
+REPORT_FILE="./property-comparison-report.csv"
+
+# CSV header
+echo '"Application","Key","DR Value","PROD Value","Status"' > "$REPORT_FILE"
+
+normalize_app_name() {
+    local filename
+    filename="$(basename "$1")"
+
+    filename="${filename%.dr.properties}"
+    filename="${filename%.DR.properties}"
+    filename="${filename%.prod.properties}"
+    filename="${filename%.PROD.properties}"
+    filename="${filename%.properties}"
+
+    printf '%s\n' "$filename"
+}
+
+escape_csv() {
+    local value="$1"
+    value="${value//\"/\"\"}"
+    printf '"%s"' "$value"
+}
+
+compare_files() {
+    local app_name="$1"
+    local dr_file="$2"
+    local prod_file="$3"
+
+    echo
+    echo "============================================================"
+    echo "Application: $app_name"
+    echo "DR file    : $(basename "$dr_file")"
+    echo "PROD file  : $(basename "$prod_file")"
+    echo "============================================================"
+
+    awk -v app="$app_name" -v report="$REPORT_FILE" '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+
+        function csv(value) {
+            gsub(/"/, "\"\"", value)
+            return "\"" value "\""
+        }
+
+        function load_file(file, values, keys, source, line, separator, key, value) {
+            while ((getline line < file) > 0) {
+                sub(/\r$/, "", line)
+
+                if (line ~ /^[[:space:]]*$/ ||
+                    line ~ /^[[:space:]]*#/ ||
+                    line ~ /^[[:space:]]*!/) {
+                    continue
+                }
+
+                separator = index(line, "=")
+
+                # Also support key:value format
+                if (separator == 0) {
+                    separator = index(line, ":")
+                }
+
+                if (separator == 0) {
+                    continue
+                }
+
+                key = trim(substr(line, 1, separator - 1))
+                value = trim(substr(line, separator + 1))
+
+                values[key] = value
+                keys[key] = 1
+            }
+
+            close(file)
+        }
+
+        BEGIN {
+            load_file(ARGV[1], dr_values, all_keys)
+            load_file(ARGV[2], prod_values, all_keys)
+
+            delete ARGV[1]
+            delete ARGV[2]
+
+            found_difference = 0
+
+            for (key in all_keys) {
+                dr_exists = key in dr_values
+                prod_exists = key in prod_values
+
+                if (dr_exists && prod_exists && dr_values[key] != prod_values[key]) {
+                    status = "Different value"
+                } else if (dr_exists && !prod_exists) {
+                    status = "Only in DR"
+                } else if (!dr_exists && prod_exists) {
+                    status = "Only in PROD"
+                } else {
+                    continue
+                }
+
+                found_difference = 1
+
+                print status ": " key
+                print "  DR   = " (dr_exists ? dr_values[key] : "<missing>")
+                print "  PROD = " (prod_exists ? prod_values[key] : "<missing>")
+                print ""
+
+                print csv(app) "," \
+                      csv(key) "," \
+                      csv(dr_exists ? dr_values[key] : "") "," \
+                      csv(prod_exists ? prod_values[key] : "") "," \
+                      csv(status) >> report
+            }
+
+            if (!found_difference) {
+                print "No differences found."
+            }
+        }
+    ' "$dr_file" "$prod_file"
+}
+
+declare -A PROD_FILES
+declare -A MATCHED_PROD_FILES
+
+# Index all PROD files by normalized application name
+while IFS= read -r -d '' prod_file; do
+    app_name="$(normalize_app_name "$prod_file")"
+    PROD_FILES["$app_name"]="$prod_file"
+done < <(find "$PROD_DIR" -maxdepth 1 -type f -iname "*.properties" -print0)
+
+# Process each DR file
+while IFS= read -r -d '' dr_file; do
+    app_name="$(normalize_app_name "$dr_file")"
+    prod_file="${PROD_FILES[$app_name]:-}"
+
+    if [[ -z "$prod_file" ]]; then
+        echo
+        echo "No matching PROD file for application: $app_name"
+
+        escaped_app="$(escape_csv "$app_name")"
+        echo "$escaped_app,\"\",\"\",\"\",\"Missing PROD file\"" >> "$REPORT_FILE"
+        continue
+    fi
+
+    MATCHED_PROD_FILES["$app_name"]=1
+    compare_files "$app_name" "$dr_file" "$prod_file"
+
+done < <(find "$DR_DIR" -maxdepth 1 -type f -iname "*.properties" -print0)
+
+# Find PROD applications that do not have a matching DR file
+for app_name in "${!PROD_FILES[@]}"; do
+    if [[ -z "${MATCHED_PROD_FILES[$app_name]:-}" ]]; then
+        echo
+        echo "No matching DR file for application: $app_name"
+
+        escaped_app="$(escape_csv "$app_name")"
+        echo "$escaped_app,\"\",\"\",\"\",\"Missing DR file\"" >> "$REPORT_FILE"
+    fi
+done
+
+echo
+echo "============================================================"
+echo "Comparison completed."
+echo "CSV report created: $REPORT_FILE"
+echo "============================================================"

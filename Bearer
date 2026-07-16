@@ -1,0 +1,1047 @@
+<#
+.SYNOPSIS
+    Exports Runtime Manager application property keys from the DEV
+    environment across all accessible Anypoint business groups.
+
+.DESCRIPTION
+    This version uses a temporary bearer token copied from the browser's
+    Developer Tools.
+
+    It is intended for Hybrid/on-premises Mule applications managed through
+    Runtime Manager.
+
+    By default, the script exports property keys only—not values.
+
+.EXAMPLE
+    .\Export-AnypointRuntimeManagerKeys.ps1 `
+        -BearerToken "eyJ..." `
+        -RootOrganizationId "your-root-organization-id"
+
+.EXAMPLE
+    $token = Read-Host "Paste bearer token"
+    .\Export-AnypointRuntimeManagerKeys.ps1 `
+        -BearerToken $token `
+        -RootOrganizationId "your-root-organization-id" `
+        -EnvironmentName "DEV"
+#>
+
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory = $true)]
+    [string]$BearerToken,
+
+    [Parameter(Mandatory = $true)]
+    [string]$RootOrganizationId,
+
+    [Parameter(Mandatory = $false)]
+    [string]$EnvironmentName = "DEV",
+
+    [Parameter(Mandatory = $false)]
+    [string]$AnypointBaseUrl = "https://anypoint.mulesoft.com",
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputCsv = ".\Anypoint-DEV-RuntimeManager-Keys.csv",
+
+    [Parameter(Mandatory = $false)]
+    [string]$ErrorCsv = ".\Anypoint-DEV-RuntimeManager-Errors.csv"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# Helps Windows PowerShell 5.1 use TLS 1.2.
+[Net.ServicePointManager]::SecurityProtocol =
+    [Net.ServicePointManager]::SecurityProtocol -bor
+    [Net.SecurityProtocolType]::Tls12
+
+$BaseUrl = $AnypointBaseUrl.TrimEnd("/")
+
+# Allow the user to paste either:
+# eyJ...
+#
+# or:
+# Bearer eyJ...
+$BearerToken = $BearerToken.Trim()
+
+if ($BearerToken -match '^(?i)Bearer\s+') {
+    $BearerToken = $BearerToken -replace '^(?i)Bearer\s+', ''
+}
+
+if ([string]::IsNullOrWhiteSpace($BearerToken)) {
+    throw "Bearer token cannot be empty."
+}
+
+$script:BearerToken = $BearerToken
+
+$results = [System.Collections.Generic.List[object]]::new()
+$errors  = [System.Collections.Generic.List[object]]::new()
+
+
+function Invoke-AnypointGet {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$AdditionalHeaders
+    )
+
+    $headers = @{
+        Authorization = "Bearer $script:BearerToken"
+        Accept        = "application/json"
+    }
+
+    if ($AdditionalHeaders) {
+        foreach ($headerName in $AdditionalHeaders.Keys) {
+            $headers[$headerName] = $AdditionalHeaders[$headerName]
+        }
+    }
+
+    try {
+        return Invoke-RestMethod `
+            -Method Get `
+            -Uri $Uri `
+            -Headers $headers
+    }
+    catch {
+        $statusCode = $null
+        $responseBody = $null
+
+        if ($_.Exception.Response) {
+            try {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+            catch {
+                $statusCode = $null
+            }
+        }
+
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $responseBody = $_.ErrorDetails.Message
+        }
+
+        if ($statusCode -eq 401) {
+            throw "401 Unauthorized. The bearer token is invalid or expired."
+        }
+
+        if ($statusCode -eq 403) {
+            throw "403 Forbidden. Your Anypoint user does not have permission for this resource."
+        }
+
+        $message = "GET request failed: $Uri"
+
+        if ($statusCode) {
+            $message += " | HTTP status: $statusCode"
+        }
+
+        if ($responseBody) {
+            $message += " | Response: $responseBody"
+        }
+        else {
+            $message += " | Error: $($_.Exception.Message)"
+        }
+
+        throw $message
+    }
+}
+
+
+function Test-AnypointToken {
+    [CmdletBinding()]
+    param()
+
+    $uri = "$BaseUrl/accounts/api/me"
+
+    try {
+        $currentUser = Invoke-AnypointGet -Uri $uri
+
+        $username = $null
+
+        foreach ($field in @("username", "email", "firstName")) {
+            if ($currentUser.PSObject.Properties.Name -contains $field) {
+                $value = [string]$currentUser.$field
+
+                if (-not [string]::IsNullOrWhiteSpace($value)) {
+                    $username = $value
+                    break
+                }
+            }
+        }
+
+        if ($username) {
+            Write-Host "Authentication successful: $username"
+        }
+        else {
+            Write-Host "Authentication successful."
+        }
+
+        return $currentUser
+    }
+    catch {
+        throw "Bearer-token validation failed. $($_.Exception.Message)"
+    }
+}
+
+
+function ConvertTo-ObjectArray {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        $Response
+    )
+
+    if ($null -eq $Response) {
+        return @()
+    }
+
+    foreach ($collectionProperty in @(
+        "data",
+        "items",
+        "content",
+        "applications",
+        "environments",
+        "organizations"
+    )) {
+        if ($Response.PSObject.Properties.Name -contains $collectionProperty) {
+            $collection = $Response.$collectionProperty
+
+            if ($null -eq $collection) {
+                return @()
+            }
+
+            return @($collection)
+        }
+    }
+
+    return @($Response)
+}
+
+
+function Get-OrganizationHierarchy {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$OrganizationId
+    )
+
+    $uri = "$BaseUrl/accounts/api/organizations/$OrganizationId/hierarchy"
+    $response = Invoke-AnypointGet -Uri $uri
+
+    $organizations =
+        [System.Collections.Generic.List[object]]::new()
+
+    function Add-OrganizationNode {
+        param (
+            [Parameter(Mandatory = $true)]
+            $Node,
+
+            [Parameter(Mandatory = $false)]
+            [string]$ParentOrganizationName
+        )
+
+        if ($null -eq $Node) {
+            return
+        }
+
+        $nodeId = $null
+        $nodeName = $null
+
+        foreach ($idField in @(
+            "id",
+            "organizationId",
+            "orgId"
+        )) {
+            if ($Node.PSObject.Properties.Name -contains $idField) {
+                $value = [string]$Node.$idField
+
+                if (-not [string]::IsNullOrWhiteSpace($value)) {
+                    $nodeId = $value
+                    break
+                }
+            }
+        }
+
+        foreach ($nameField in @(
+            "name",
+            "organizationName"
+        )) {
+            if ($Node.PSObject.Properties.Name -contains $nameField) {
+                $value = [string]$Node.$nameField
+
+                if (-not [string]::IsNullOrWhiteSpace($value)) {
+                    $nodeName = $value
+                    break
+                }
+            }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($nodeId)) {
+            $organizations.Add(
+                [PSCustomObject]@{
+                    OrganizationId         = $nodeId
+                    OrganizationName       = $nodeName
+                    ParentOrganizationName = $ParentOrganizationName
+                }
+            )
+        }
+
+        foreach ($childField in @(
+            "subOrganizations",
+            "children",
+            "businessGroups"
+        )) {
+            if ($Node.PSObject.Properties.Name -contains $childField) {
+                foreach ($child in @($Node.$childField)) {
+                    if ($null -ne $child) {
+                        Add-OrganizationNode `
+                            -Node $child `
+                            -ParentOrganizationName $nodeName
+                    }
+                }
+            }
+        }
+    }
+
+    foreach ($rootNode in (ConvertTo-ObjectArray -Response $response)) {
+        Add-OrganizationNode -Node $rootNode
+    }
+
+    # Make sure the supplied root organization is included.
+    if (-not ($organizations.OrganizationId -contains $OrganizationId)) {
+        try {
+            $rootUri =
+                "$BaseUrl/accounts/api/organizations/$OrganizationId"
+
+            $rootDetails = Invoke-AnypointGet -Uri $rootUri
+
+            $organizations.Insert(
+                0,
+                [PSCustomObject]@{
+                    OrganizationId         = $OrganizationId
+                    OrganizationName       = $rootDetails.name
+                    ParentOrganizationName = $null
+                }
+            )
+        }
+        catch {
+            $organizations.Insert(
+                0,
+                [PSCustomObject]@{
+                    OrganizationId         = $OrganizationId
+                    OrganizationName       = "Root organization"
+                    ParentOrganizationName = $null
+                }
+            )
+        }
+    }
+
+    return @(
+        $organizations |
+            Group-Object OrganizationId |
+            ForEach-Object {
+                $_.Group | Select-Object -First 1
+            } |
+            Sort-Object OrganizationName
+    )
+}
+
+
+function Get-OrganizationEnvironments {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$OrganizationId
+    )
+
+    $uri =
+        "$BaseUrl/accounts/api/organizations/$OrganizationId/environments"
+
+    $response = Invoke-AnypointGet -Uri $uri
+
+    return @(
+        ConvertTo-ObjectArray -Response $response
+    )
+}
+
+
+function Get-HybridApplications {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$OrganizationId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$EnvironmentId
+    )
+
+    $headers = @{
+        "X-ANYPNT-ORG-ID" = $OrganizationId
+        "X-ANYPNT-ENV-ID" = $EnvironmentId
+    }
+
+    $applications =
+        [System.Collections.Generic.List[object]]::new()
+
+    $limit = 100
+    $offset = 0
+
+    while ($true) {
+        $uri =
+            "$BaseUrl/hybrid/api/v1/applications" +
+            "?limit=$limit&offset=$offset"
+
+        $response = Invoke-AnypointGet `
+            -Uri $uri `
+            -AdditionalHeaders $headers
+
+        $page = @(
+            ConvertTo-ObjectArray -Response $response
+        )
+
+        foreach ($application in $page) {
+            if ($null -ne $application) {
+                $applications.Add($application)
+            }
+        }
+
+        Write-Verbose (
+            "Retrieved {0} applications at offset {1}" -f
+            $page.Count,
+            $offset
+        )
+
+        if ($page.Count -lt $limit) {
+            break
+        }
+
+        $offset += $limit
+    }
+
+    return @($applications)
+}
+
+
+function Get-ApplicationIdentifier {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        $Application
+    )
+
+    foreach ($field in @(
+        "id",
+        "applicationId",
+        "deploymentId"
+    )) {
+        if ($Application.PSObject.Properties.Name -contains $field) {
+            $value = [string]$Application.$field
+
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                return $value
+            }
+        }
+    }
+
+    return $null
+}
+
+
+function Get-ApplicationName {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        $Application
+    )
+
+    foreach ($field in @(
+        "name",
+        "applicationName",
+        "artifactName"
+    )) {
+        if ($Application.PSObject.Properties.Name -contains $field) {
+            $value = [string]$Application.$field
+
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                return $value
+            }
+        }
+    }
+
+    return "Unknown application"
+}
+
+
+function Add-KeysFromContainer {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        $Container,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.HashSet[string]]$KeySet
+    )
+
+    if ($null -eq $Container) {
+        return
+    }
+
+    # Hashtable or dictionary format:
+    #
+    # {
+    #   "host": "server01",
+    #   "port": "8081"
+    # }
+    if ($Container -is [System.Collections.IDictionary]) {
+        foreach ($key in $Container.Keys) {
+            $keyString = [string]$key
+
+            if (-not [string]::IsNullOrWhiteSpace($keyString)) {
+                [void]$KeySet.Add($keyString)
+            }
+        }
+
+        return
+    }
+
+    # Array format:
+    #
+    # [
+    #   { "key": "host", "value": "server01" },
+    #   { "key": "port", "value": "8081" }
+    # ]
+    if (
+        $Container -is [System.Collections.IEnumerable] -and
+        $Container -isnot [string] -and
+        $Container -isnot [PSCustomObject]
+    ) {
+        foreach ($entry in @($Container)) {
+            if ($null -eq $entry) {
+                continue
+            }
+
+            foreach ($keyField in @(
+                "key",
+                "name",
+                "propertyName"
+            )) {
+                if ($entry.PSObject.Properties.Name -contains $keyField) {
+                    $keyValue = [string]$entry.$keyField
+
+                    if (-not [string]::IsNullOrWhiteSpace($keyValue)) {
+                        [void]$KeySet.Add($keyValue)
+                        break
+                    }
+                }
+            }
+        }
+
+        return
+    }
+
+    # Single array-entry object:
+    #
+    # { "key": "host", "value": "server01" }
+    foreach ($keyField in @(
+        "key",
+        "name",
+        "propertyName"
+    )) {
+        if ($Container.PSObject.Properties.Name -contains $keyField) {
+            $keyValue = [string]$Container.$keyField
+
+            if (-not [string]::IsNullOrWhiteSpace($keyValue)) {
+                [void]$KeySet.Add($keyValue)
+                return
+            }
+        }
+    }
+
+    # PSCustomObject map format:
+    #
+    # properties.host
+    # properties.port
+    foreach ($property in $Container.PSObject.Properties) {
+        if (
+            $property.Name -notin @(
+                "count",
+                "total",
+                "offset",
+                "limit"
+            ) -and
+            -not [string]::IsNullOrWhiteSpace($property.Name)
+        ) {
+            [void]$KeySet.Add($property.Name)
+        }
+    }
+}
+
+
+function Get-PropertyNamesFromObject {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        $InputObject
+    )
+
+    $propertyNames =
+        [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+
+    if ($null -eq $InputObject) {
+        return @()
+    }
+
+    $containerNames = @(
+        "properties",
+        "applicationProperties",
+        "systemProperties",
+        "secureProperties",
+        "environmentVariables"
+    )
+
+    foreach ($containerName in $containerNames) {
+        if ($InputObject.PSObject.Properties.Name -contains $containerName) {
+            Add-KeysFromContainer `
+                -Container $InputObject.$containerName `
+                -KeySet $propertyNames
+        }
+    }
+
+    # Some endpoints return the property map directly instead of wrapping it
+    # inside a "properties" field.
+    $knownWrapperFields = @(
+        "id",
+        "name",
+        "status",
+        "target",
+        "artifact",
+        "configuration",
+        "settings",
+        "deploymentSettings",
+        "application"
+    )
+
+    $objectFieldNames = @($InputObject.PSObject.Properties.Name)
+
+    $containsKnownWrapper =
+        @($objectFieldNames | Where-Object {
+            $_ -in $knownWrapperFields
+        }).Count -gt 0
+
+    if (
+        -not $containsKnownWrapper -and
+        $objectFieldNames.Count -gt 0
+    ) {
+        Add-KeysFromContainer `
+            -Container $InputObject `
+            -KeySet $propertyNames
+    }
+
+    return @($propertyNames | Sort-Object)
+}
+
+
+function Get-HybridApplicationPropertyKeys {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$OrganizationId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$EnvironmentId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ApplicationId,
+
+        [Parameter(Mandatory = $true)]
+        $ApplicationListObject
+    )
+
+    $headers = @{
+        "X-ANYPNT-ORG-ID" = $OrganizationId
+        "X-ANYPNT-ENV-ID" = $EnvironmentId
+    }
+
+    $allKeys =
+        [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+
+    # Check whether properties were already included in the application-list
+    # response.
+    foreach (
+        $key in (
+            Get-PropertyNamesFromObject `
+                -InputObject $ApplicationListObject
+        )
+    ) {
+        [void]$allKeys.Add($key)
+    }
+
+    # Runtime Manager/browser API responses can differ by deployment type
+    # and control-plane release, so the script tries several read endpoints.
+    $candidateUris = @(
+        "$BaseUrl/hybrid/api/v1/applications/$ApplicationId/properties",
+        "$BaseUrl/hybrid/api/v1/applications/$ApplicationId"
+    )
+
+    foreach ($uri in $candidateUris) {
+        try {
+            $response = Invoke-AnypointGet `
+                -Uri $uri `
+                -AdditionalHeaders $headers
+
+            foreach (
+                $key in (
+                    Get-PropertyNamesFromObject `
+                        -InputObject $response
+                )
+            ) {
+                [void]$allKeys.Add($key)
+            }
+
+            foreach ($nestedField in @(
+                "configuration",
+                "settings",
+                "deploymentSettings",
+                "application"
+            )) {
+                if (
+                    $response.PSObject.Properties.Name -contains
+                    $nestedField
+                ) {
+                    foreach (
+                        $key in (
+                            Get-PropertyNamesFromObject `
+                                -InputObject $response.$nestedField
+                        )
+                    ) {
+                        [void]$allKeys.Add($key)
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Verbose (
+                "Endpoint did not return properties for application " +
+                "$ApplicationId`: $uri"
+            )
+        }
+    }
+
+    return @($allKeys | Sort-Object)
+}
+
+
+# ------------------------------------------------------------
+# Main execution
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "Validating bearer token..."
+
+$currentUser = Test-AnypointToken
+
+Write-Host ""
+Write-Host "Retrieving organization hierarchy..."
+
+$organizations = @(
+    Get-OrganizationHierarchy `
+        -OrganizationId $RootOrganizationId
+)
+
+Write-Host (
+    "Organizations/business groups discovered: {0}" -f
+    $organizations.Count
+)
+
+foreach ($organization in $organizations) {
+    Write-Host ""
+    Write-Host "--------------------------------------------------"
+    Write-Host "Business group: $($organization.OrganizationName)"
+    Write-Host "Organization ID: $($organization.OrganizationId)"
+
+    try {
+        $environments = @(
+            Get-OrganizationEnvironments `
+                -OrganizationId $organization.OrganizationId
+        )
+    }
+    catch {
+        Write-Warning (
+            "Could not retrieve environments for " +
+            "$($organization.OrganizationName)."
+        )
+
+        $errors.Add(
+            [PSCustomObject]@{
+                BusinessGroup  = $organization.OrganizationName
+                OrganizationId = $organization.OrganizationId
+                Environment    = $EnvironmentName
+                EnvironmentId  = $null
+                Application    = $null
+                ApplicationId  = $null
+                Operation      = "Get environments"
+                ErrorMessage   = $_.Exception.Message
+            }
+        )
+
+        continue
+    }
+
+    $matchingEnvironments = @(
+        $environments |
+            Where-Object {
+                $_.name -ieq $EnvironmentName
+            }
+    )
+
+    if ($matchingEnvironments.Count -eq 0) {
+        Write-Host (
+            "Environment '$EnvironmentName' not found. Skipping."
+        )
+
+        continue
+    }
+
+    foreach ($environment in $matchingEnvironments) {
+        $environmentId = [string]$environment.id
+        $environmentActualName = [string]$environment.name
+
+        Write-Host "Environment: $environmentActualName"
+        Write-Host "Environment ID: $environmentId"
+
+        try {
+            $applications = @(
+                Get-HybridApplications `
+                    -OrganizationId $organization.OrganizationId `
+                    -EnvironmentId $environmentId
+            )
+        }
+        catch {
+            Write-Warning (
+                "Could not retrieve Runtime Manager applications."
+            )
+
+            $errors.Add(
+                [PSCustomObject]@{
+                    BusinessGroup  = $organization.OrganizationName
+                    OrganizationId = $organization.OrganizationId
+                    Environment    = $environmentActualName
+                    EnvironmentId  = $environmentId
+                    Application    = $null
+                    ApplicationId  = $null
+                    Operation      = "Get Hybrid applications"
+                    ErrorMessage   = $_.Exception.Message
+                }
+            )
+
+            continue
+        }
+
+        Write-Host "Applications found: $($applications.Count)"
+
+        foreach ($application in $applications) {
+            $applicationId =
+                Get-ApplicationIdentifier `
+                    -Application $application
+
+            $applicationName =
+                Get-ApplicationName `
+                    -Application $application
+
+            if ([string]::IsNullOrWhiteSpace($applicationId)) {
+                Write-Warning (
+                    "No application ID returned for $applicationName."
+                )
+
+                $errors.Add(
+                    [PSCustomObject]@{
+                        BusinessGroup  = $organization.OrganizationName
+                        OrganizationId = $organization.OrganizationId
+                        Environment    = $environmentActualName
+                        EnvironmentId  = $environmentId
+                        Application    = $applicationName
+                        ApplicationId  = $null
+                        Operation      = "Resolve application ID"
+                        ErrorMessage   = "No application ID was returned."
+                    }
+                )
+
+                continue
+            }
+
+            Write-Host "Reading: $applicationName"
+
+            try {
+                $keys = @(
+                    Get-HybridApplicationPropertyKeys `
+                        -OrganizationId $organization.OrganizationId `
+                        -EnvironmentId $environmentId `
+                        -ApplicationId $applicationId `
+                        -ApplicationListObject $application
+                )
+
+                if ($keys.Count -eq 0) {
+                    $results.Add(
+                        [PSCustomObject]@{
+                            BusinessGroup  =
+                                $organization.OrganizationName
+
+                            OrganizationId =
+                                $organization.OrganizationId
+
+                            Environment =
+                                $environmentActualName
+
+                            EnvironmentId =
+                                $environmentId
+
+                            Application =
+                                $applicationName
+
+                            ApplicationId =
+                                $applicationId
+
+                            PropertyKey =
+                                $null
+
+                            KeyFound =
+                                $false
+                        }
+                    )
+
+                    Write-Host "  No readable property keys found."
+                    continue
+                }
+
+                foreach ($key in $keys) {
+                    $results.Add(
+                        [PSCustomObject]@{
+                            BusinessGroup  =
+                                $organization.OrganizationName
+
+                            OrganizationId =
+                                $organization.OrganizationId
+
+                            Environment =
+                                $environmentActualName
+
+                            EnvironmentId =
+                                $environmentId
+
+                            Application =
+                                $applicationName
+
+                            ApplicationId =
+                                $applicationId
+
+                            PropertyKey =
+                                $key
+
+                            KeyFound =
+                                $true
+                        }
+                    )
+                }
+
+                Write-Host "  Keys found: $($keys.Count)"
+            }
+            catch {
+                Write-Warning (
+                    "Failed to retrieve keys for $applicationName."
+                )
+
+                $errors.Add(
+                    [PSCustomObject]@{
+                        BusinessGroup  =
+                            $organization.OrganizationName
+
+                        OrganizationId =
+                            $organization.OrganizationId
+
+                        Environment =
+                            $environmentActualName
+
+                        EnvironmentId =
+                            $environmentId
+
+                        Application =
+                            $applicationName
+
+                        ApplicationId =
+                            $applicationId
+
+                        Operation =
+                            "Get application properties"
+
+                        ErrorMessage =
+                            $_.Exception.Message
+                    }
+                )
+            }
+        }
+    }
+}
+
+
+# Create parent directories if necessary.
+foreach ($filePath in @($OutputCsv, $ErrorCsv)) {
+    $parentDirectory = Split-Path `
+        -Path $filePath `
+        -Parent
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($parentDirectory) -and
+        -not (Test-Path $parentDirectory)
+    ) {
+        New-Item `
+            -ItemType Directory `
+            -Path $parentDirectory `
+            -Force |
+            Out-Null
+    }
+}
+
+
+$results |
+    Sort-Object `
+        BusinessGroup,
+        Environment,
+        Application,
+        PropertyKey |
+    Export-Csv `
+        -Path $OutputCsv `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+
+$errors |
+    Sort-Object `
+        BusinessGroup,
+        Environment,
+        Application,
+        Operation |
+    Export-Csv `
+        -Path $ErrorCsv `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+
+Write-Host ""
+Write-Host "=================================================="
+Write-Host "Completed."
+Write-Host "=================================================="
+
+if (Test-Path $OutputCsv) {
+    Write-Host "Key report:   $((Resolve-Path $OutputCsv).Path)"
+}
+
+if (Test-Path $ErrorCsv) {
+    Write-Host "Error report: $((Resolve-Path $ErrorCsv).Path)"
+}
+
+Write-Host "Result rows:  $($results.Count)"
+Write-Host "Error rows:   $($errors.Count)"

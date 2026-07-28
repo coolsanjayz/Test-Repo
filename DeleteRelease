@@ -1,0 +1,600 @@
+# CreateDevelopAndDeleteAllReleaseBranches.ps1
+
+$Pat = "YOUR_PAT"
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+$RepoListFile = ".\repo-list.txt"
+
+$MainBranch = "main"
+$DevelopBranch = "develop"
+
+# Pattern used to identify all branches under release/
+$ReleaseBranchPattern = "release/*"
+
+$ApiVersion = "7.1"
+
+# $true  = preview only
+# $false = perform actual changes
+$DryRun = $true
+
+$EncodedPat = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes(":$Pat")
+)
+
+$Headers = @{
+    Authorization = "Basic $EncodedPat"
+}
+
+$ZeroCommit = "0000000000000000000000000000000000000000"
+
+$Results = @()
+
+function Get-RepoNameFromLine {
+    param(
+        [string]$Line
+    )
+
+    $Line = $Line.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($Line)) {
+        return $null
+    }
+
+    if ($Line.StartsWith("#")) {
+        return $null
+    }
+
+    # Supports a full Azure DevOps repository URL.
+    if ($Line -match "/_git/([^/?#]+)") {
+        return [uri]::UnescapeDataString($Matches[1])
+    }
+
+    # Also supports a plain repository name.
+    return $Line
+}
+
+function Get-BranchRef {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BranchName
+    )
+
+    $Filter = [uri]::EscapeDataString("heads/$BranchName")
+
+    $Uri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?filter=$Filter&api-version=$ApiVersion"
+
+    $Response = Invoke-RestMethod `
+        -Uri $Uri `
+        -Headers $Headers `
+        -Method Get `
+        -ErrorAction Stop
+
+    return $Response.value |
+        Where-Object {
+            $_.name -eq "refs/heads/$BranchName"
+        } |
+        Select-Object -First 1
+}
+
+function Get-ReleaseBranchRefs {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoId
+    )
+
+    # Azure DevOps REST filtering uses a prefix.
+    # This retrieves refs beginning with refs/heads/release/.
+    $Filter = [uri]::EscapeDataString("heads/release/")
+
+    $Uri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?filter=$Filter&api-version=$ApiVersion"
+
+    $Response = Invoke-RestMethod `
+        -Uri $Uri `
+        -Headers $Headers `
+        -Method Get `
+        -ErrorAction Stop
+
+    # release/* is used here as the PowerShell matching pattern.
+    return @(
+        $Response.value |
+            Where-Object {
+                $_.name -like "refs/heads/$ReleaseBranchPattern"
+            } |
+            Sort-Object name
+    )
+}
+
+function Invoke-RefUpdate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoId,
+
+        [Parameter(Mandatory = $true)]
+        [array]$RefUpdateBody
+    )
+
+    $Uri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?api-version=$ApiVersion"
+
+    $JsonBody = ConvertTo-Json `
+        -InputObject $RefUpdateBody `
+        -Depth 10
+
+    Write-Host ""
+    Write-Host "Refs URI:"
+    Write-Host $Uri
+
+    Write-Host "Request Body:"
+    Write-Host $JsonBody
+
+    if ($DryRun) {
+        Write-Host "DRY RUN: no update performed."
+        return $null
+    }
+
+    $Response = Invoke-RestMethod `
+        -Uri $Uri `
+        -Headers $Headers `
+        -Method Post `
+        -ContentType "application/json" `
+        -Body $JsonBody `
+        -ErrorAction Stop
+
+    if (-not $Response.value) {
+        throw "Azure DevOps returned no ref update response."
+    }
+
+    $FailedUpdates = @(
+        $Response.value |
+            Where-Object {
+                $_.success -ne $true
+            }
+    )
+
+    if ($FailedUpdates.Count -gt 0) {
+        $FailureMessages = foreach ($Item in $FailedUpdates) {
+            (
+                "Ref: $($Item.name), " +
+                "Status: $($Item.updateStatus), " +
+                "Message: $($Item.customMessage)"
+            )
+        }
+
+        throw (
+            "One or more ref updates failed: " +
+            ($FailureMessages -join " | ")
+        )
+    }
+
+    return $Response
+}
+
+# ---------------------------------------------------------
+# Validate settings and input file
+# ---------------------------------------------------------
+
+if ([string]::IsNullOrWhiteSpace($Pat) -or $Pat -eq "YOUR_PAT") {
+    Write-Error "Set the Azure DevOps PAT in the `$Pat variable."
+    exit 1
+}
+
+if (-not (Test-Path $RepoListFile)) {
+    Write-Error "repo-list.txt not found: $RepoListFile"
+    exit 1
+}
+
+$RepoNames = Get-Content $RepoListFile |
+    ForEach-Object {
+        Get-RepoNameFromLine $_
+    } |
+    Where-Object {
+        $_
+    } |
+    Select-Object -Unique
+
+Write-Host ""
+Write-Host "====================================================="
+Write-Host "Create develop and delete all release/* branches"
+Write-Host "====================================================="
+Write-Host "Organization        : $Org"
+Write-Host "Project             : $Project"
+Write-Host "Repositories loaded : $($RepoNames.Count)"
+Write-Host "Dry run             : $DryRun"
+Write-Host "Release pattern     : $ReleaseBranchPattern"
+Write-Host "====================================================="
+
+Write-Host ""
+Write-Host "Repo names loaded:"
+
+$RepoNames |
+    ForEach-Object {
+        Write-Host " - $_"
+    }
+
+# ---------------------------------------------------------
+# Load all repositories from Azure DevOps
+# ---------------------------------------------------------
+
+$ReposUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories?api-version=$ApiVersion"
+
+Write-Host ""
+Write-Host "Loading Azure DevOps repositories..."
+
+try {
+    $AllRepos = (
+        Invoke-RestMethod `
+            -Uri $ReposUri `
+            -Headers $Headers `
+            -Method Get `
+            -ErrorAction Stop
+    ).value
+}
+catch {
+    Write-Error "Unable to load Azure DevOps repositories: $($_.Exception.Message)"
+    exit 1
+}
+
+Write-Host "Azure Repos returned: $($AllRepos.Count)"
+
+# ---------------------------------------------------------
+# Process each repository
+# ---------------------------------------------------------
+
+foreach ($RepoName in $RepoNames) {
+    Write-Host ""
+    Write-Host "====================================================="
+    Write-Host "Processing: $RepoName"
+    Write-Host "====================================================="
+
+    $MainCommit = ""
+    $DevelopCommit = ""
+
+    $DevelopAction = ""
+    $ReleaseAction = ""
+
+    $ReleaseBranchesFound = 0
+    $ReleaseBranchesDeleted = 0
+    $ReleaseBranchNames = ""
+
+    try {
+        $Repo = $AllRepos |
+            Where-Object {
+                $_.name -eq $RepoName
+            } |
+            Select-Object -First 1
+
+        if (-not $Repo) {
+            Write-Warning "Repository not found: $RepoName"
+
+            $Results += [PSCustomObject]@{
+                Repo                    = $RepoName
+                Status                  = "SKIPPED"
+                Reason                  = "Repository not found"
+                MainCommit              = ""
+                DevelopCommit           = ""
+                DevelopAction           = "Not processed"
+                ReleaseAction           = "Not processed"
+                ReleaseBranchesFound    = 0
+                ReleaseBranchesDeleted  = 0
+                ReleaseBranchNames      = ""
+            }
+
+            continue
+        }
+
+        $RepoId = $Repo.id
+
+        Write-Host "RepoId: $RepoId"
+
+        # -------------------------------------------------
+        # Load main, develop, and all release/* branches
+        # -------------------------------------------------
+
+        $MainRef = Get-BranchRef `
+            -RepoId $RepoId `
+            -BranchName $MainBranch
+
+        $DevelopRef = Get-BranchRef `
+            -RepoId $RepoId `
+            -BranchName $DevelopBranch
+
+        $ReleaseRefs = Get-ReleaseBranchRefs `
+            -RepoId $RepoId
+
+        if ($MainRef) {
+            $MainCommit = $MainRef.objectId
+
+            Write-Host "main exists."
+            Write-Host "Main commit: $MainCommit"
+        }
+        else {
+            Write-Warning "main branch does not exist."
+        }
+
+        # -------------------------------------------------
+        # STEP 1: Create develop from main when missing
+        # -------------------------------------------------
+
+        Write-Host ""
+        Write-Host "STEP 1: Process develop branch"
+
+        if ($DevelopRef) {
+            $DevelopCommit = $DevelopRef.objectId
+            $DevelopAction = "Existing develop left unchanged"
+
+            Write-Host "develop already exists."
+            Write-Host "Develop commit: $DevelopCommit"
+            Write-Host "No changes will be made to develop."
+        }
+        else {
+            Write-Host "develop does not exist."
+
+            if (-not $MainRef) {
+                throw "Cannot create develop because main does not exist."
+            }
+
+            $CreateDevelopBody = @(
+                @{
+                    name        = "refs/heads/$DevelopBranch"
+                    oldObjectId = $ZeroCommit
+                    newObjectId = $MainCommit
+                }
+            )
+
+            Write-Host "Creating develop from main commit:"
+            Write-Host $MainCommit
+
+            Invoke-RefUpdate `
+                -RepoId $RepoId `
+                -RefUpdateBody $CreateDevelopBody |
+                Out-Null
+
+            $DevelopCommit = $MainCommit
+
+            if ($DryRun) {
+                $DevelopAction = "Would create develop from main"
+            }
+            else {
+                $DevelopAction = "Created develop from main"
+                Write-Host "develop created successfully."
+            }
+        }
+
+        # -------------------------------------------------
+        # STEP 2: Find all release/* branches
+        # -------------------------------------------------
+
+        Write-Host ""
+        Write-Host "STEP 2: Find all release/* branches"
+
+        $ReleaseBranchesFound = $ReleaseRefs.Count
+
+        if ($ReleaseBranchesFound -eq 0) {
+            Write-Host "No release/* branches found."
+
+            $ReleaseAction = "No release branches found"
+        }
+        else {
+            $ReleaseBranchNames = (
+                $ReleaseRefs |
+                    ForEach-Object {
+                        $_.name -replace "^refs/heads/", ""
+                    }
+            ) -join "; "
+
+            Write-Host "Release branches found: $ReleaseBranchesFound"
+
+            foreach ($ReleaseRef in $ReleaseRefs) {
+                $ShortBranchName = $ReleaseRef.name -replace "^refs/heads/", ""
+
+                Write-Host " - $ShortBranchName"
+                Write-Host "   Commit: $($ReleaseRef.objectId)"
+            }
+
+            # -------------------------------------------------
+            # STEP 3: Build one deletion request containing
+            # every release/* branch
+            # -------------------------------------------------
+
+            $DeleteReleaseBody = @(
+                foreach ($ReleaseRef in $ReleaseRefs) {
+                    @{
+                        name        = $ReleaseRef.name
+                        oldObjectId = $ReleaseRef.objectId
+                        newObjectId = $ZeroCommit
+                    }
+                }
+            )
+
+            Write-Host ""
+            Write-Host "STEP 3: Delete all release/* branches"
+
+            Invoke-RefUpdate `
+                -RepoId $RepoId `
+                -RefUpdateBody $DeleteReleaseBody |
+                Out-Null
+
+            if ($DryRun) {
+                $ReleaseBranchesDeleted = 0
+                $ReleaseAction = "Would delete $ReleaseBranchesFound release branch(es)"
+            }
+            else {
+                $ReleaseBranchesDeleted = $ReleaseBranchesFound
+                $ReleaseAction = "Deleted $ReleaseBranchesDeleted release branch(es)"
+
+                Write-Host ""
+                Write-Host "Deleted release branches: $ReleaseBranchesDeleted"
+            }
+        }
+
+        $ReasonParts = @()
+
+        if ($DevelopAction) {
+            $ReasonParts += $DevelopAction
+        }
+
+        if ($ReleaseAction) {
+            $ReasonParts += $ReleaseAction
+        }
+
+        $Results += [PSCustomObject]@{
+            Repo                    = $RepoName
+            Status                  = if ($DryRun) {
+                "DRY_RUN"
+            }
+            else {
+                "SUCCESS"
+            }
+            Reason                  = $ReasonParts -join "; "
+            MainCommit              = $MainCommit
+            DevelopCommit           = $DevelopCommit
+            DevelopAction           = $DevelopAction
+            ReleaseAction           = $ReleaseAction
+            ReleaseBranchesFound    = $ReleaseBranchesFound
+            ReleaseBranchesDeleted  = $ReleaseBranchesDeleted
+            ReleaseBranchNames      = $ReleaseBranchNames
+        }
+    }
+    catch {
+        $Message = $_.Exception.Message
+
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $Message += " | Details: $($_.ErrorDetails.Message)"
+        }
+
+        Write-Warning "Failed: $RepoName - $Message"
+
+        $Results += [PSCustomObject]@{
+            Repo                    = $RepoName
+            Status                  = "FAILED"
+            Reason                  = $Message
+            MainCommit              = $MainCommit
+            DevelopCommit           = $DevelopCommit
+            DevelopAction           = $DevelopAction
+            ReleaseAction           = $ReleaseAction
+            ReleaseBranchesFound    = $ReleaseBranchesFound
+            ReleaseBranchesDeleted  = $ReleaseBranchesDeleted
+            ReleaseBranchNames      = $ReleaseBranchNames
+        }
+
+        continue
+    }
+}
+
+# ---------------------------------------------------------
+# Export results
+# ---------------------------------------------------------
+
+$Report = ".\create-develop-delete-all-release-results.csv"
+
+$Results |
+    Export-Csv `
+        -Path $Report `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+$SuccessfulCount = @(
+    $Results |
+        Where-Object {
+            $_.Status -eq "SUCCESS"
+        }
+).Count
+
+$DryRunCount = @(
+    $Results |
+        Where-Object {
+            $_.Status -eq "DRY_RUN"
+        }
+).Count
+
+$FailedCount = @(
+    $Results |
+        Where-Object {
+            $_.Status -eq "FAILED"
+        }
+).Count
+
+$SkippedCount = @(
+    $Results |
+        Where-Object {
+            $_.Status -eq "SKIPPED"
+        }
+).Count
+
+$ExistingDevelopCount = @(
+    $Results |
+        Where-Object {
+            $_.DevelopAction -eq "Existing develop left unchanged"
+        }
+).Count
+
+$DevelopCreatedCount = @(
+    $Results |
+        Where-Object {
+            $_.DevelopAction -eq "Created develop from main"
+        }
+).Count
+
+$DevelopWouldCreateCount = @(
+    $Results |
+        Where-Object {
+            $_.DevelopAction -eq "Would create develop from main"
+        }
+).Count
+
+$TotalReleaseBranchesFound = (
+    $Results |
+        Measure-Object `
+            -Property ReleaseBranchesFound `
+            -Sum
+).Sum
+
+$TotalReleaseBranchesDeleted = (
+    $Results |
+        Measure-Object `
+            -Property ReleaseBranchesDeleted `
+            -Sum
+).Sum
+
+if ($null -eq $TotalReleaseBranchesFound) {
+    $TotalReleaseBranchesFound = 0
+}
+
+if ($null -eq $TotalReleaseBranchesDeleted) {
+    $TotalReleaseBranchesDeleted = 0
+}
+
+Write-Host ""
+Write-Host "====================================================="
+Write-Host "Completed"
+Write-Host "====================================================="
+Write-Host "Total repositories          : $($Results.Count)"
+Write-Host "Successful                  : $SuccessfulCount"
+Write-Host "Dry run                     : $DryRunCount"
+Write-Host "Failed                      : $FailedCount"
+Write-Host "Skipped                     : $SkippedCount"
+Write-Host "Existing develop unchanged  : $ExistingDevelopCount"
+Write-Host "Develop created             : $DevelopCreatedCount"
+Write-Host "Develop would be created    : $DevelopWouldCreateCount"
+Write-Host "Release branches found      : $TotalReleaseBranchesFound"
+Write-Host "Release branches deleted    : $TotalReleaseBranchesDeleted"
+Write-Host "Report                      : $Report"
+Write-Host "====================================================="
+
+if ($DryRun) {
+    Write-Host ""
+    Write-Host "This was a dry run. No branches were created or deleted."
+    Write-Host "Review the console output and CSV report."
+    Write-Host "Then change `$DryRun to `$false for real execution."
+}
+
+if ($FailedCount -gt 0) {
+    Write-Warning "One or more repositories failed. Review the CSV report."
+    exit 1
+}
+
+exit 0

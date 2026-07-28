@@ -1,0 +1,544 @@
+```powershell
+# BackupAllRepos.ps1
+#
+# Creates a complete local mirror backup of every Azure DevOps repository
+# listed in repo-list.txt.
+#
+# The backup includes:
+#   - All branches
+#   - All tags
+#   - Complete commit history
+#   - Other Git refs
+#   - Optional Git LFS objects
+#
+# Run this script BEFORE running:
+# CreateDevelopAndRemoveReleaseBranch.ps1
+
+$Pat = "YOUR_PAT"
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+$RepoListFile = ".\repo-list.txt"
+
+# Change this to the local drive/folder where backups should be stored.
+$BackupBasePath = "C:\AzureReposBackup"
+
+# Set to $true when repositories use Git LFS and you also want LFS objects.
+$BackupGitLfs = $true
+
+# Azure DevOps REST API version used to retrieve repository information.
+$ApiVersion = "7.1-preview.1"
+
+$EncodedPat = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes(":$Pat")
+)
+
+$Headers = @{
+    Authorization = "Basic $EncodedPat"
+}
+
+# Git receives the PAT through an HTTP header.
+# The PAT is not added to the clone URL or saved in the repository remote URL.
+$GitAuthHeader = "AUTHORIZATION: Basic $EncodedPat"
+
+$Results = @()
+
+# Create a new timestamped folder for every backup run.
+$BackupTimestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+
+$BackupRoot = Join-Path `
+    -Path $BackupBasePath `
+    -ChildPath "MuleSoftRepos-$BackupTimestamp"
+
+function Get-RepoNameFromLine {
+    param(
+        [string]$Line
+    )
+
+    $Line = $Line.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($Line)) {
+        return $null
+    }
+
+    if ($Line.StartsWith("#")) {
+        return $null
+    }
+
+    # Supports complete Azure DevOps repository URLs.
+    if ($Line -match "/_git/([^/?#]+)") {
+        return [uri]::UnescapeDataString($Matches[1])
+    }
+
+    # Also supports repository names directly.
+    return $Line
+}
+
+function Get-SafeFolderName {
+    param(
+        [string]$Name
+    )
+
+    $InvalidCharacters = [System.IO.Path]::GetInvalidFileNameChars()
+
+    $SafeName = $Name
+
+    foreach ($Character in $InvalidCharacters) {
+        $SafeName = $SafeName.Replace($Character, "_")
+    }
+
+    return $SafeName
+}
+
+function Invoke-GitCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $false)]
+        [string]$WorkingDirectory
+    )
+
+    if ($WorkingDirectory) {
+        Push-Location $WorkingDirectory
+    }
+
+    try {
+        $Output = & git @Arguments 2>&1
+        $ExitCode = $LASTEXITCODE
+
+        if ($ExitCode -ne 0) {
+            $OutputText = $Output -join [Environment]::NewLine
+
+            throw "Git command failed with exit code $ExitCode.`n$OutputText"
+        }
+
+        return $Output
+    }
+    finally {
+        if ($WorkingDirectory) {
+            Pop-Location
+        }
+    }
+}
+
+# ---------------------------------------------------------
+# Prerequisite checks
+# ---------------------------------------------------------
+
+if ([string]::IsNullOrWhiteSpace($Pat) -or $Pat -eq "YOUR_PAT") {
+    Write-Error "Set the Azure DevOps PAT in the `$Pat variable."
+    exit 1
+}
+
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Write-Error "Git is not installed or is not available in PATH."
+    exit 1
+}
+
+if (-not (Test-Path $RepoListFile)) {
+    Write-Error "repo-list.txt not found: $RepoListFile"
+    exit 1
+}
+
+if (-not (Test-Path $BackupBasePath)) {
+    Write-Host "Creating backup base folder: $BackupBasePath"
+
+    New-Item `
+        -Path $BackupBasePath `
+        -ItemType Directory `
+        -Force |
+        Out-Null
+}
+
+New-Item `
+    -Path $BackupRoot `
+    -ItemType Directory `
+    -Force |
+    Out-Null
+
+Write-Host ""
+Write-Host "====================================================="
+Write-Host "Azure DevOps Repository Backup"
+Write-Host "====================================================="
+Write-Host "Organization : $Org"
+Write-Host "Project      : $Project"
+Write-Host "Backup root  : $BackupRoot"
+Write-Host "Git LFS      : $BackupGitLfs"
+Write-Host "====================================================="
+
+# ---------------------------------------------------------
+# Load requested repositories
+# ---------------------------------------------------------
+
+$RepoNames = Get-Content $RepoListFile |
+    ForEach-Object {
+        Get-RepoNameFromLine $_
+    } |
+    Where-Object {
+        $_
+    } |
+    Select-Object -Unique
+
+Write-Host ""
+Write-Host "Repositories requested: $($RepoNames.Count)"
+
+$RepoNames |
+    ForEach-Object {
+        Write-Host " - $_"
+    }
+
+# ---------------------------------------------------------
+# Load Azure DevOps repository metadata
+# ---------------------------------------------------------
+
+$ReposUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories?api-version=$ApiVersion"
+
+Write-Host ""
+Write-Host "Loading Azure DevOps repositories..."
+
+try {
+    $AllRepos = (
+        Invoke-RestMethod `
+            -Uri $ReposUri `
+            -Headers $Headers `
+            -Method Get `
+            -ErrorAction Stop
+    ).value
+}
+catch {
+    Write-Error "Unable to retrieve Azure DevOps repositories: $($_.Exception.Message)"
+    exit 1
+}
+
+Write-Host "Azure Repos returned: $($AllRepos.Count)"
+
+# ---------------------------------------------------------
+# Check Git LFS availability
+# ---------------------------------------------------------
+
+$GitLfsAvailable = $false
+
+if ($BackupGitLfs) {
+    & git lfs version *> $null
+
+    if ($LASTEXITCODE -eq 0) {
+        $GitLfsAvailable = $true
+        Write-Host "Git LFS is installed."
+    }
+    else {
+        Write-Warning "Git LFS is not installed. Normal Git data will still be backed up."
+    }
+}
+
+# ---------------------------------------------------------
+# Back up each repository
+# ---------------------------------------------------------
+
+foreach ($RepoName in $RepoNames) {
+    Write-Host ""
+    Write-Host "====================================================="
+    Write-Host "Backing up: $RepoName"
+    Write-Host "====================================================="
+
+    $BackupPath = ""
+    $BranchCount = 0
+    $TagCount = 0
+    $RefCount = 0
+    $LfsStatus = "Not requested"
+
+    try {
+        $Repo = $AllRepos |
+            Where-Object {
+                $_.name -eq $RepoName
+            } |
+            Select-Object -First 1
+
+        if (-not $Repo) {
+            Write-Warning "Repository not found in Azure DevOps: $RepoName"
+
+            $Results += [PSCustomObject]@{
+                Repo         = $RepoName
+                Status       = "SKIPPED"
+                Reason       = "Repository not found in Azure DevOps"
+                BackupPath   = ""
+                BranchCount  = 0
+                TagCount     = 0
+                RefCount     = 0
+                LfsStatus    = "Not processed"
+                BackupTime   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            }
+
+            continue
+        }
+
+        $SafeRepoName = Get-SafeFolderName -Name $Repo.name
+
+        # A mirror repository is normally stored with a .git suffix.
+        $BackupPath = Join-Path `
+            -Path $BackupRoot `
+            -ChildPath "$SafeRepoName.git"
+
+        if (Test-Path $BackupPath) {
+            throw "Backup path already exists: $BackupPath"
+        }
+
+        # Use the Azure DevOps-provided remote URL.
+        $RemoteUrl = $Repo.remoteUrl
+
+        if ([string]::IsNullOrWhiteSpace($RemoteUrl)) {
+            throw "Azure DevOps did not return a clone URL for the repository."
+        }
+
+        Write-Host "Repository ID : $($Repo.id)"
+        Write-Host "Remote URL    : $RemoteUrl"
+        Write-Host "Backup path   : $BackupPath"
+
+        Write-Host ""
+        Write-Host "Cloning complete repository mirror..."
+
+        $CloneArguments = @(
+            "-c"
+            "http.extraheader=$GitAuthHeader"
+            "clone"
+            "--mirror"
+            "--no-progress"
+            $RemoteUrl
+            $BackupPath
+        )
+
+        Invoke-GitCommand `
+            -Arguments $CloneArguments |
+            Out-Null
+
+        if (-not (Test-Path $BackupPath)) {
+            throw "Git completed without creating the expected backup folder."
+        }
+
+        Write-Host "Mirror clone completed."
+
+        # -------------------------------------------------
+        # Verify Git object integrity
+        # -------------------------------------------------
+
+        Write-Host ""
+        Write-Host "Verifying repository object integrity..."
+
+        $FsckArguments = @(
+            "-C"
+            $BackupPath
+            "fsck"
+            "--full"
+            "--no-dangling"
+        )
+
+        Invoke-GitCommand `
+            -Arguments $FsckArguments |
+            Out-Null
+
+        Write-Host "Git object verification completed."
+
+        # -------------------------------------------------
+        # Count branches, tags, and all refs
+        # -------------------------------------------------
+
+        $BranchOutput = Invoke-GitCommand -Arguments @(
+            "-C"
+            $BackupPath
+            "for-each-ref"
+            "--format=%(refname)"
+            "refs/heads/"
+        )
+
+        $TagOutput = Invoke-GitCommand -Arguments @(
+            "-C"
+            $BackupPath
+            "for-each-ref"
+            "--format=%(refname)"
+            "refs/tags/"
+        )
+
+        $AllRefOutput = Invoke-GitCommand -Arguments @(
+            "-C"
+            $BackupPath
+            "for-each-ref"
+            "--format=%(refname)"
+        )
+
+        $BranchCount = @(
+            $BranchOutput |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_)
+                }
+        ).Count
+
+        $TagCount = @(
+            $TagOutput |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_)
+                }
+        ).Count
+
+        $RefCount = @(
+            $AllRefOutput |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_)
+                }
+        ).Count
+
+        Write-Host "Branches backed up : $BranchCount"
+        Write-Host "Tags backed up     : $TagCount"
+        Write-Host "Total refs         : $RefCount"
+
+        # -------------------------------------------------
+        # Optional Git LFS backup
+        # -------------------------------------------------
+
+        if ($BackupGitLfs) {
+            if ($GitLfsAvailable) {
+                Write-Host ""
+                Write-Host "Fetching all Git LFS objects..."
+
+                $LfsArguments = @(
+                    "-c"
+                    "http.extraheader=$GitAuthHeader"
+                    "-C"
+                    $BackupPath
+                    "lfs"
+                    "fetch"
+                    "--all"
+                    "origin"
+                )
+
+                Invoke-GitCommand `
+                    -Arguments $LfsArguments |
+                    Out-Null
+
+                $LfsStatus = "All LFS objects fetched"
+
+                Write-Host "Git LFS backup completed."
+            }
+            else {
+                $LfsStatus = "Git LFS unavailable"
+            }
+        }
+
+        # -------------------------------------------------
+        # Save ref inventory inside the backup root
+        # -------------------------------------------------
+
+        $RefInventoryPath = Join-Path `
+            -Path $BackupRoot `
+            -ChildPath "$SafeRepoName-refs.txt"
+
+        $AllRefDetails = Invoke-GitCommand -Arguments @(
+            "-C"
+            $BackupPath
+            "for-each-ref"
+            "--sort=refname"
+            "--format=%(refname) %(objectname)"
+        )
+
+        $AllRefDetails |
+            Out-File `
+                -FilePath $RefInventoryPath `
+                -Encoding UTF8
+
+        Write-Host "Ref inventory saved: $RefInventoryPath"
+
+        $Results += [PSCustomObject]@{
+            Repo         = $RepoName
+            Status       = "SUCCESS"
+            Reason       = "Complete mirror backup created and verified"
+            BackupPath   = $BackupPath
+            BranchCount  = $BranchCount
+            TagCount     = $TagCount
+            RefCount     = $RefCount
+            LfsStatus    = $LfsStatus
+            BackupTime   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        }
+    }
+    catch {
+        $Message = $_.Exception.Message
+
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $Message += " | Details: $($_.ErrorDetails.Message)"
+        }
+
+        Write-Warning "Backup failed: $RepoName - $Message"
+
+        $Results += [PSCustomObject]@{
+            Repo         = $RepoName
+            Status       = "FAILED"
+            Reason       = $Message
+            BackupPath   = $BackupPath
+            BranchCount  = $BranchCount
+            TagCount     = $TagCount
+            RefCount     = $RefCount
+            LfsStatus    = $LfsStatus
+            BackupTime   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        }
+
+        continue
+    }
+}
+
+# ---------------------------------------------------------
+# Export report
+# ---------------------------------------------------------
+
+$Report = Join-Path `
+    -Path $BackupRoot `
+    -ChildPath "repository-backup-results.csv"
+
+$Results |
+    Export-Csv `
+        -Path $Report `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+$SuccessfulCount = @(
+    $Results |
+        Where-Object {
+            $_.Status -eq "SUCCESS"
+        }
+).Count
+
+$FailedCount = @(
+    $Results |
+        Where-Object {
+            $_.Status -eq "FAILED"
+        }
+).Count
+
+$SkippedCount = @(
+    $Results |
+        Where-Object {
+            $_.Status -eq "SKIPPED"
+        }
+).Count
+
+Write-Host ""
+Write-Host "====================================================="
+Write-Host "Backup completed"
+Write-Host "====================================================="
+Write-Host "Backup folder       : $BackupRoot"
+Write-Host "Total repositories  : $($Results.Count)"
+Write-Host "Successful backups  : $SuccessfulCount"
+Write-Host "Failed backups      : $FailedCount"
+Write-Host "Skipped repositories: $SkippedCount"
+Write-Host "Report              : $Report"
+Write-Host "====================================================="
+
+if ($FailedCount -gt 0 -or $SkippedCount -gt 0) {
+    Write-Warning "Not every requested repository was backed up successfully."
+    Write-Warning "Review the CSV report before executing the branch modification script."
+    exit 1
+}
+
+Write-Host ""
+Write-Host "All requested repositories were backed up successfully."
+Write-Host "You may now run the branch modification script."
+exit 0
+```

@@ -1,0 +1,602 @@
+# ============================================================
+# Rollout-SyncMainTask.ps1
+#
+# PURPOSE
+# Bulk-update Azure DevOps Classic Release definitions.
+#
+# For every Classic Release definition:
+#   1. Back up full definition JSON
+#   2. Find PROD environment
+#   3. Find agent-based deployment phase
+#   4. Check whether "Sync Main to PROD" already exists
+#   5. Append it as the LAST task
+#   6. Preserve all existing tasks/settings
+#   7. Save updated release definition
+#
+# The actual sync logic remains centralized here:
+#
+# mulesoft-pipelines/release-pipelines/scripts/
+#     Sync-Main-To-Prod.ps1
+#
+# ============================================================
+
+$ErrorActionPreference = "Stop"
+
+# ------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------
+
+$Org     = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+# Use a PAT that can READ + EDIT Classic Release definitions.
+# This is ONLY for the one-time rollout.
+$Pat = "YOUR_PAT"
+
+# Always run TRUE first.
+$DryRun = $true
+
+# Environment name in your Classic Release definitions.
+$ProdEnvironmentName = "PROD"
+
+# New task details
+$TaskDisplayName = "Sync Main to PROD"
+
+$CentralScriptPath = `
+    "mulesoft-pipelines/release-pipelines/scripts/Sync-Main-To-Prod.ps1"
+
+
+# ------------------------------------------------------------
+# AUTHENTICATION
+# ------------------------------------------------------------
+
+$Auth = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes(":$Pat")
+)
+
+$Headers = @{
+    Authorization  = "Basic $Auth"
+    "Content-Type" = "application/json"
+}
+
+
+# ------------------------------------------------------------
+# PROJECT ENCODING
+# ------------------------------------------------------------
+
+$EncodedProject = [uri]::EscapeDataString($Project)
+
+
+# ------------------------------------------------------------
+# RELEASE API BASE
+# IMPORTANT: Classic Release uses vsrm.dev.azure.com
+# ------------------------------------------------------------
+
+$ReleaseApiBase = `
+    "https://vsrm.dev.azure.com/$Org/$EncodedProject/_apis/release"
+
+
+# ------------------------------------------------------------
+# BACKUP DIRECTORY
+# ------------------------------------------------------------
+
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+$BackupRoot = Join-Path `
+    $PSScriptRoot `
+    "ReleaseDefinitionBackup_$Timestamp"
+
+New-Item `
+    -ItemType Directory `
+    -Path $BackupRoot `
+    -Force | Out-Null
+
+
+Write-Host ""
+Write-Host "========================================================"
+Write-Host " CLASSIC RELEASE BULK ROLLOUT"
+Write-Host "========================================================"
+Write-Host "Organization : $Org"
+Write-Host "Project      : $Project"
+Write-Host "Environment  : $ProdEnvironmentName"
+Write-Host "Dry Run      : $DryRun"
+Write-Host "Backups      : $BackupRoot"
+Write-Host ""
+
+
+# ------------------------------------------------------------
+# RESULTS
+# ------------------------------------------------------------
+
+$Results = @()
+
+
+# ------------------------------------------------------------
+# STEP 1
+# GET ALL RELEASE DEFINITIONS
+# ------------------------------------------------------------
+
+Write-Host "Getting Classic Release definitions..."
+
+$DefinitionsUrl = `
+    "$ReleaseApiBase/definitions?`$top=1000&api-version=7.1"
+
+
+try {
+
+    $DefinitionList = Invoke-RestMethod `
+        -Uri $DefinitionsUrl `
+        -Method GET `
+        -Headers $Headers
+
+}
+catch {
+
+    throw "Unable to retrieve release definitions. $($_.Exception.Message)"
+}
+
+
+if (
+    $null -eq $DefinitionList.value -or
+    $DefinitionList.value.Count -eq 0
+) {
+    throw "No Classic Release definitions found."
+}
+
+
+Write-Host "Found $($DefinitionList.value.Count) release definitions."
+Write-Host ""
+
+
+# ------------------------------------------------------------
+# PROCESS EACH RELEASE DEFINITION
+# ------------------------------------------------------------
+
+foreach ($DefinitionSummary in $DefinitionList.value) {
+
+    $DefinitionId   = $DefinitionSummary.id
+    $DefinitionName = $DefinitionSummary.name
+
+    Write-Host ""
+    Write-Host "========================================================"
+    Write-Host "Processing: $DefinitionName"
+    Write-Host "Definition ID: $DefinitionId"
+    Write-Host "========================================================"
+
+
+    $Result = [PSCustomObject]@{
+        DefinitionId   = $DefinitionId
+        DefinitionName = $DefinitionName
+        ProdFound      = $false
+        TaskExists     = $false
+        Action         = ""
+        Status         = ""
+    }
+
+
+    try {
+
+        # ====================================================
+        # STEP 2
+        # GET COMPLETE RELEASE DEFINITION
+        # ====================================================
+
+        $DefinitionUrl = `
+            "$ReleaseApiBase/definitions/$DefinitionId?api-version=7.1"
+
+        $Definition = Invoke-RestMethod `
+            -Uri $DefinitionUrl `
+            -Method GET `
+            -Headers $Headers
+
+
+        # ====================================================
+        # STEP 3
+        # BACK UP ORIGINAL JSON
+        # ====================================================
+
+        $SafeName = $DefinitionName `
+            -replace '[^a-zA-Z0-9._-]', '_'
+
+        $BackupFile = Join-Path `
+            $BackupRoot `
+            "$($DefinitionId)_$SafeName.json"
+
+
+        $Definition |
+            ConvertTo-Json -Depth 100 |
+            Set-Content `
+                -Path $BackupFile `
+                -Encoding UTF8
+
+
+        Write-Host "Backup created:"
+        Write-Host "  $BackupFile"
+
+
+        # ====================================================
+        # STEP 4
+        # FIND PROD ENVIRONMENT
+        # ====================================================
+
+        $ProdEnvironment = $Definition.environments |
+            Where-Object {
+                $_.name -eq $ProdEnvironmentName
+            } |
+            Select-Object -First 1
+
+
+        if ($null -eq $ProdEnvironment) {
+
+            Write-Host "PROD environment not found. Skipping."
+
+            $Result.Action = "SKIP"
+            $Result.Status = "PROD environment not found"
+
+            $Results += $Result
+
+            continue
+        }
+
+
+        $Result.ProdFound = $true
+
+        Write-Host "PROD environment found."
+
+
+        # ====================================================
+        # STEP 5
+        # FIND AGENT DEPLOYMENT PHASE
+        #
+        # Your screenshots show an Agent job.
+        #
+        # Classic Release typically stores this as:
+        #
+        # deployPhases[]
+        #   workflowTasks[]
+        #
+        # ====================================================
+
+        if (
+            $null -eq $ProdEnvironment.deployPhases -or
+            $ProdEnvironment.deployPhases.Count -eq 0
+        ) {
+
+            Write-Host "No deployment phases found in PROD."
+
+            $Result.Action = "SKIP"
+            $Result.Status = "No deployment phase"
+
+            $Results += $Result
+
+            continue
+        }
+
+
+        # Usually one Agent job.
+        # Prefer the first phase that has workflowTasks.
+        $AgentPhase = $ProdEnvironment.deployPhases |
+            Where-Object {
+                $null -ne $_.workflowTasks
+            } |
+            Select-Object -First 1
+
+
+        if ($null -eq $AgentPhase) {
+
+            Write-Host "No Agent phase with workflowTasks found."
+
+            $Result.Action = "SKIP"
+            $Result.Status = "Agent phase not found"
+
+            $Results += $Result
+
+            continue
+        }
+
+
+        # ====================================================
+        # STEP 6
+        # CHECK WHETHER TASK ALREADY EXISTS
+        # ====================================================
+
+        $ExistingTask = $AgentPhase.workflowTasks |
+            Where-Object {
+                $_.name -eq $TaskDisplayName -or
+                $_.inputs.scriptPath -eq $CentralScriptPath
+            } |
+            Select-Object -First 1
+
+
+        if ($null -ne $ExistingTask) {
+
+            Write-Host "Sync task already exists. Skipping."
+
+            $Result.TaskExists = $true
+            $Result.Action = "SKIP"
+            $Result.Status = "Already exists"
+
+            $Results += $Result
+
+            continue
+        }
+
+
+        # ====================================================
+        # STEP 7
+        # CREATE POWERSHELL TASK
+        #
+        # PowerShell task GUID:
+        # e213ff0f-5d5c-4791-802d-52ea3e7be1f1
+        #
+        # This is the standard PowerShell task.
+        #
+        # taskVersion = 2.*
+        # ====================================================
+
+        $NewTask = [PSCustomObject]@{
+
+            environment = @{}
+
+            taskId = "e213ff0f-5d5c-4791-802d-52ea3e7be1f1"
+
+            version = "2.*"
+
+            name = $TaskDisplayName
+
+            refName = ""
+
+            enabled = $true
+
+            alwaysRun = $false
+
+            continueOnError = $false
+
+            timeoutInMinutes = 0
+
+            retryCountOnTaskFailure = 0
+
+            definitionType = "task"
+
+            overrideInputs = @{}
+
+            condition = "succeeded()"
+
+            inputs = @{
+
+                targetType = "filePath"
+
+                filePath = $CentralScriptPath
+
+                arguments = ""
+
+                errorActionPreference = "stop"
+
+                warningPreference = "default"
+
+                informationPreference = "default"
+
+                verbosePreference = "default"
+
+                debugPreference = "default"
+
+                progressPreference = "silentlyContinue"
+
+                failOnStderr = "false"
+
+                showWarnings = "false"
+
+                ignoreLASTEXITCODE = "false"
+
+                pwsh = "false"
+
+                workingDirectory = ""
+            }
+        }
+
+
+        # ====================================================
+        # STEP 8
+        # APPEND AS LAST PROD TASK
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "Task would be appended after:"
+        Write-Host ""
+
+        foreach ($Task in $AgentPhase.workflowTasks) {
+            Write-Host "  - $($Task.name)"
+        }
+
+        Write-Host ""
+        Write-Host "NEW LAST TASK:"
+        Write-Host "  - $TaskDisplayName"
+
+        Write-Host ""
+        Write-Host "Script:"
+        Write-Host "  $CentralScriptPath"
+
+
+        # PowerShell arrays need explicit recreation
+        $UpdatedTasks = @(
+            $AgentPhase.workflowTasks
+        )
+
+        $UpdatedTasks += $NewTask
+
+        $AgentPhase.workflowTasks = $UpdatedTasks
+
+
+        # ====================================================
+        # STEP 9
+        # DRY RUN
+        # ====================================================
+
+        if ($DryRun) {
+
+            Write-Host ""
+            Write-Host "DRY RUN - release definition NOT modified."
+
+            $Result.Action = "WOULD ADD"
+            $Result.Status = "DRY RUN"
+
+            $Results += $Result
+
+            continue
+        }
+
+
+        # ====================================================
+        # STEP 10
+        # REMOVE READ-ONLY / RESPONSE-ONLY FIELDS IF NEEDED
+        #
+        # Azure DevOps generally accepts the GET definition
+        # body for PUT. We retain the definition structure.
+        # ====================================================
+
+        $DefinitionJson = $Definition |
+            ConvertTo-Json `
+                -Depth 100 `
+                -Compress
+
+
+        # ====================================================
+        # STEP 11
+        # UPDATE RELEASE DEFINITION
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "Updating release definition..."
+
+
+        $UpdateUrl = `
+            "$ReleaseApiBase/definitions?api-version=7.1"
+
+
+        $UpdatedDefinition = Invoke-RestMethod `
+            -Uri $UpdateUrl `
+            -Method PUT `
+            -Headers $Headers `
+            -Body $DefinitionJson
+
+
+        if ($null -eq $UpdatedDefinition) {
+            throw "Azure DevOps returned no updated definition."
+        }
+
+
+        # ====================================================
+        # STEP 12
+        # RE-READ AND VERIFY
+        # ====================================================
+
+        Write-Host "Verifying update..."
+
+
+        $VerifyDefinition = Invoke-RestMethod `
+            -Uri $DefinitionUrl `
+            -Method GET `
+            -Headers $Headers
+
+
+        $VerifyProd = $VerifyDefinition.environments |
+            Where-Object {
+                $_.name -eq $ProdEnvironmentName
+            } |
+            Select-Object -First 1
+
+
+        $VerifyPhase = $VerifyProd.deployPhases |
+            Where-Object {
+                $null -ne $_.workflowTasks
+            } |
+            Select-Object -First 1
+
+
+        $VerifyTask = $VerifyPhase.workflowTasks |
+            Where-Object {
+                $_.name -eq $TaskDisplayName -and
+                $_.inputs.filePath -eq $CentralScriptPath
+            } |
+            Select-Object -First 1
+
+
+        if ($null -eq $VerifyTask) {
+
+            throw @"
+Release definition update returned successfully,
+but the new Sync Main to PROD task could not be verified.
+"@
+        }
+
+
+        Write-Host ""
+        Write-Host "SUCCESS:"
+        Write-Host "$TaskDisplayName added to PROD."
+
+
+        $Result.Action = "ADDED"
+        $Result.Status = "SUCCESS"
+
+        $Results += $Result
+    }
+    catch {
+
+        Write-Host ""
+        Write-Host "ERROR:"
+        Write-Host $_.Exception.Message
+
+
+        $Result.Action = "ERROR"
+        $Result.Status = $_.Exception.Message
+
+        $Results += $Result
+
+        # Continue with remaining release definitions
+        continue
+    }
+}
+
+
+# ------------------------------------------------------------
+# FINAL REPORT
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host ""
+Write-Host "========================================================"
+Write-Host " ROLLOUT SUMMARY"
+Write-Host "========================================================"
+
+
+$Results |
+    Format-Table `
+        DefinitionId,
+        DefinitionName,
+        ProdFound,
+        TaskExists,
+        Action,
+        Status `
+        -AutoSize
+
+
+Write-Host ""
+Write-Host "Backups saved under:"
+Write-Host "  $BackupRoot"
+Write-Host ""
+
+
+if ($DryRun) {
+
+    Write-Host "========================================================"
+    Write-Host " DRY RUN COMPLETE"
+    Write-Host " No Classic Release definitions were modified."
+    Write-Host "========================================================"
+
+}
+else {
+
+    Write-Host "========================================================"
+    Write-Host " ROLLOUT COMPLETE"
+    Write-Host "========================================================"
+}

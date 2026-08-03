@@ -1,0 +1,741 @@
+# ============================================================
+# Sync-Main-To-Prod.ps1
+#
+# PURPOSE
+# After a successful Classic Release PROD deployment:
+#
+#   1. Read the exact commit used by the release artifact
+#   2. Determine the Git repository from the Build record
+#   3. Clone that repo temporarily
+#   4. Unlock main
+#   5. Move main directly to the deployed commit
+#   6. Verify main == deployed PROD commit
+#   7. Lock main again
+#   8. Clean the temporary clone
+#
+# IMPORTANT
+# This is NOT a merge.
+# This supports both:
+#   - forward PROD deployments
+#   - rollback PROD deployments
+#
+# main becomes the exact Git snapshot represented by
+# the commit that produced the deployed artifact.
+# ============================================================
+
+$ErrorActionPreference = "Stop"
+
+# ------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+# Classic Release primary artifact variables
+$BuildId     = "$(Build.BuildId)"
+$DeployedSHA = "$(Build.SourceVersion)"
+
+# Azure DevOps release-agent temp directory
+$AgentTemp = "$(Agent.TempDirectory)"
+
+# OAuth token supplied by Azure DevOps
+$Token = $env:SYSTEM_ACCESSTOKEN
+
+
+# ------------------------------------------------------------
+# VALIDATE VARIABLES
+# ------------------------------------------------------------
+
+if (
+    [string]::IsNullOrWhiteSpace($Token)
+) {
+    throw @"
+SYSTEM_ACCESSTOKEN is empty.
+
+Verify that the Classic Release agent job allows
+scripts to access the OAuth token.
+"@
+}
+
+if (
+    [string]::IsNullOrWhiteSpace($BuildId) -or
+    $BuildId -match '^\$\('
+) {
+    throw "Build.BuildId was not resolved."
+}
+
+if (
+    [string]::IsNullOrWhiteSpace($DeployedSHA) -or
+    $DeployedSHA -match '^\$\('
+) {
+    throw "Build.SourceVersion was not resolved."
+}
+
+if (
+    [string]::IsNullOrWhiteSpace($AgentTemp) -or
+    $AgentTemp -match '^\$\('
+) {
+    throw "Agent.TempDirectory was not resolved."
+}
+
+
+# ------------------------------------------------------------
+# AUTHENTICATION
+# ------------------------------------------------------------
+
+$Auth = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes(":$Token")
+)
+
+$Headers = @{
+    Authorization = "Basic $Auth"
+    "Content-Type" = "application/json"
+}
+
+
+Write-Host ""
+Write-Host "======================================================"
+Write-Host " PROD -> MAIN EXACT SYNCHRONIZATION"
+Write-Host "======================================================"
+Write-Host "Build ID          : $BuildId"
+Write-Host "Deployed PROD SHA : $DeployedSHA"
+Write-Host ""
+
+
+# ------------------------------------------------------------
+# STEP 1
+# GET BUILD INFORMATION
+#
+# We do NOT guess the repository name from the release name.
+# We ask Azure DevOps which repository generated this build.
+# ------------------------------------------------------------
+
+Write-Host "STEP 1 - Getting build/repository information..."
+
+$BuildApi = `
+    "https://dev.azure.com/$Org/$Project/_apis/build/builds/$BuildId?api-version=7.1"
+
+try {
+
+    $BuildInfo = Invoke-RestMethod `
+        -Uri $BuildApi `
+        -Method GET `
+        -Headers $Headers
+
+}
+catch {
+
+    throw "Unable to retrieve build $BuildId. $($_.Exception.Message)"
+}
+
+
+$RepoName = $BuildInfo.repository.name
+$RepoId   = $BuildInfo.repository.id
+$RepoType = $BuildInfo.repository.type
+
+
+if ([string]::IsNullOrWhiteSpace($RepoName)) {
+    throw "Repository name could not be determined from build $BuildId."
+}
+
+if ([string]::IsNullOrWhiteSpace($RepoId)) {
+    throw "Repository ID could not be determined from build $BuildId."
+}
+
+if ($RepoType -ne "TfsGit") {
+
+    throw @"
+Unexpected repository type: $RepoType
+
+Expected Azure Repos Git / TfsGit.
+"@
+}
+
+
+Write-Host "Repository name    : $RepoName"
+Write-Host "Repository ID      : $RepoId"
+Write-Host "Repository type    : $RepoType"
+
+# Build API returns repository information, including its
+# friendly name and repository ID. This makes the script generic
+# across all application release definitions.
+
+
+# ------------------------------------------------------------
+# URLS
+# ------------------------------------------------------------
+
+$RepoUrl = "https://dev.azure.com/$Org/$Project/_git/$RepoName"
+
+$LockApi = `
+    "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?filter=heads/main&api-version=7.1"
+
+
+# ------------------------------------------------------------
+# TEMPORARY CLONE LOCATION
+# ------------------------------------------------------------
+
+$SafeRepoName = $RepoName -replace '[^a-zA-Z0-9._-]', '_'
+
+$TempFolder = Join-Path `
+    $AgentTemp `
+    "ProdMainSync_$SafeRepoName_$([guid]::NewGuid().ToString('N'))"
+
+
+Write-Host "Temporary clone    : $TempFolder"
+Write-Host ""
+
+
+$LocationChanged = $false
+$MainUnlocked = $false
+
+
+try {
+
+    # ========================================================
+    # STEP 2 - CLONE APPLICATION REPOSITORY
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "STEP 2 - Cloning application repository..."
+
+    git `
+        -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+        clone `
+        --quiet `
+        --no-checkout `
+        $RepoUrl `
+        $TempFolder
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Repository clone failed for $RepoName."
+    }
+
+
+    Push-Location $TempFolder
+
+    $LocationChanged = $true
+
+
+    # ========================================================
+    # STEP 3 - FETCH ALL REFS/TAGS
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "STEP 3 - Fetching refs..."
+
+    git `
+        -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+        fetch `
+        origin `
+        --prune `
+        --tags `
+        --force `
+        --quiet
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git fetch failed."
+    }
+
+
+    # ========================================================
+    # STEP 4 - VERIFY MAIN EXISTS
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "STEP 4 - Verifying origin/main..."
+
+    git rev-parse `
+        --verify `
+        refs/remotes/origin/main *> $null
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "origin/main does not exist in $RepoName."
+    }
+
+
+    # ========================================================
+    # STEP 5 - VERIFY PROD COMMIT EXISTS
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "STEP 5 - Verifying deployed PROD commit..."
+
+    git cat-file `
+        -e `
+        "$DeployedSHA^{commit}" 2>$null
+
+
+    if ($LASTEXITCODE -ne 0) {
+
+        Write-Host "Deployed commit isn't available locally."
+        Write-Host "Attempting direct fetch..."
+
+        git `
+            -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+            fetch `
+            origin `
+            $DeployedSHA `
+            --quiet
+
+        if ($LASTEXITCODE -ne 0) {
+
+            throw @"
+Unable to fetch deployed commit:
+
+$DeployedSHA
+
+from repository:
+
+$RepoName
+"@
+        }
+    }
+
+
+    $DeployedFullSHA = (
+        git rev-parse "$DeployedSHA^{commit}"
+    ).Trim()
+
+
+    Write-Host "Resolved PROD SHA : $DeployedFullSHA"
+
+
+    # ========================================================
+    # STEP 6 - GET CURRENT REMOTE MAIN
+    # ========================================================
+
+    $CurrentMainSHA = (
+        git rev-parse refs/remotes/origin/main
+    ).Trim()
+
+
+    Write-Host ""
+    Write-Host "Current main SHA  : $CurrentMainSHA"
+    Write-Host "Deployed PROD SHA : $DeployedFullSHA"
+
+
+    # ========================================================
+    # STEP 7 - NO CHANGE REQUIRED
+    # ========================================================
+
+    if ($CurrentMainSHA -eq $DeployedFullSHA) {
+
+        Write-Host ""
+        Write-Host "======================================================"
+        Write-Host " NO CHANGE REQUIRED"
+        Write-Host "======================================================"
+        Write-Host "main already exactly matches deployed PROD."
+        Write-Host ""
+
+        return
+    }
+
+
+    # ========================================================
+    # STEP 8 - DETERMINE FORWARD / ROLLBACK
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "STEP 8 - Determining deployment direction..."
+
+    git merge-base `
+        --is-ancestor `
+        $CurrentMainSHA `
+        $DeployedFullSHA
+
+    if ($LASTEXITCODE -eq 0) {
+
+        Write-Host "Deployment direction: FORWARD"
+
+    }
+    else {
+
+        git merge-base `
+            --is-ancestor `
+            $DeployedFullSHA `
+            $CurrentMainSHA
+
+        if ($LASTEXITCODE -eq 0) {
+
+            Write-Host "Deployment direction: ROLLBACK"
+
+        }
+        else {
+
+            Write-Host "Deployment direction: DIVERGED HISTORY"
+            Write-Host "main will still be synchronized exactly to PROD."
+        }
+    }
+
+
+    # ========================================================
+    # STEP 9 - UNLOCK MAIN
+    #
+    # Azure DevOps provides a dedicated PATCH endpoint for
+    # locking/unlocking a Git ref.
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "STEP 9 - Unlocking main..."
+
+    $UnlockBody = @{
+        isLocked = $false
+    } | ConvertTo-Json
+
+
+    try {
+
+        $UnlockResult = Invoke-RestMethod `
+            -Uri $LockApi `
+            -Method PATCH `
+            -Headers $Headers `
+            -Body $UnlockBody
+
+    }
+    catch {
+
+        throw "Failed to unlock main. $($_.Exception.Message)"
+    }
+
+
+    if ($UnlockResult.isLocked -eq $true) {
+        throw "Azure DevOps still reports main as locked."
+    }
+
+
+    $MainUnlocked = $true
+
+    Write-Host "main unlocked."
+
+
+    # ========================================================
+    # STEP 10 - REFRESH MAIN AFTER UNLOCK
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "STEP 10 - Refreshing main immediately before sync..."
+
+    git `
+        -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+        fetch `
+        origin `
+        "+refs/heads/main:refs/remotes/origin/main" `
+        --quiet
+
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to refresh origin/main."
+    }
+
+
+    $CurrentMainSHA = (
+        git rev-parse refs/remotes/origin/main
+    ).Trim()
+
+
+    Write-Host "main before synchronization:"
+    Write-Host "  $CurrentMainSHA"
+
+
+    # ========================================================
+    # STEP 11 - EXACT SYNCHRONIZATION
+    #
+    # NO MERGE
+    # NO REBASE
+    # NO CHERRY-PICK
+    #
+    # main is moved directly to the deployed commit.
+    #
+    # --force-with-lease protects against another process
+    # changing main after our final fetch.
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "STEP 11 - Synchronizing main to PROD..."
+
+    Write-Host ""
+    Write-Host "FROM:"
+    Write-Host "  $CurrentMainSHA"
+
+    Write-Host ""
+    Write-Host "TO:"
+    Write-Host "  $DeployedFullSHA"
+
+
+    git `
+        -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+        push `
+        "--force-with-lease=refs/heads/main:$CurrentMainSHA" `
+        origin `
+        "${DeployedFullSHA}:refs/heads/main"
+
+
+    if ($LASTEXITCODE -ne 0) {
+
+        throw @"
+MAIN SYNCHRONIZATION FAILED.
+
+Possible causes:
+
+- Build Service does not have Force push permission
+- Build Service does not have Bypass policies when pushing
+- main changed after our final fetch
+- authentication failed
+- main could not actually be unlocked
+"@
+    }
+
+
+    # ========================================================
+    # STEP 12 - VERIFY REMOTE MAIN DIRECTLY
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "STEP 12 - Verifying remote main..."
+
+    $RemoteMainLine = git `
+        -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+        ls-remote `
+        --heads `
+        origin `
+        refs/heads/main
+
+
+    if ([string]::IsNullOrWhiteSpace($RemoteMainLine)) {
+        throw "Unable to retrieve remote main after synchronization."
+    }
+
+
+    $RemoteMainSHA = (
+        $RemoteMainLine -split '\s+'
+    )[0].Trim()
+
+
+    Write-Host ""
+    Write-Host "PROD SHA : $DeployedFullSHA"
+    Write-Host "main SHA : $RemoteMainSHA"
+
+
+    if ($RemoteMainSHA -ne $DeployedFullSHA) {
+
+        throw @"
+CRITICAL VERIFICATION FAILURE.
+
+main does NOT match deployed PROD.
+
+Deployed PROD:
+$DeployedFullSHA
+
+Remote main:
+$RemoteMainSHA
+"@
+    }
+
+
+    # ========================================================
+    # STEP 13 - VERIFY GIT TREE
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "STEP 13 - Verifying exact repository snapshot..."
+
+    $ProdTreeSHA = (
+        git rev-parse "$DeployedFullSHA^{tree}"
+    ).Trim()
+
+
+    $MainTreeSHA = (
+        git rev-parse "$RemoteMainSHA^{tree}"
+    ).Trim()
+
+
+    Write-Host "PROD tree : $ProdTreeSHA"
+    Write-Host "main tree : $MainTreeSHA"
+
+
+    if ($ProdTreeSHA -ne $MainTreeSHA) {
+
+        throw @"
+Git tree verification failed.
+
+main does not contain the exact PROD snapshot.
+"@
+    }
+
+
+    Write-Host "Commit verification PASSED."
+    Write-Host "Tree verification   PASSED."
+
+
+    # ========================================================
+    # STEP 14 - LOCK MAIN AGAIN
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "STEP 14 - Locking main again..."
+
+
+    $LockBody = @{
+        isLocked = $true
+    } | ConvertTo-Json
+
+
+    try {
+
+        $LockResult = Invoke-RestMethod `
+            -Uri $LockApi `
+            -Method PATCH `
+            -Headers $Headers `
+            -Body $LockBody
+
+    }
+    catch {
+
+        throw @"
+PROD -> main synchronization succeeded,
+but main could not be locked again.
+
+Repository:
+$RepoName
+
+main SHA:
+$RemoteMainSHA
+
+Error:
+$($_.Exception.Message)
+"@
+    }
+
+
+    if ($LockResult.isLocked -ne $true) {
+        throw "Azure DevOps did not confirm that main was locked."
+    }
+
+
+    $MainUnlocked = $false
+
+
+    # ========================================================
+    # SUCCESS
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "======================================================"
+    Write-Host " SUCCESS"
+    Write-Host "======================================================"
+    Write-Host ""
+    Write-Host "Repository:"
+    Write-Host "  $RepoName"
+    Write-Host ""
+    Write-Host "PROD commit:"
+    Write-Host "  $DeployedFullSHA"
+    Write-Host ""
+    Write-Host "main commit:"
+    Write-Host "  $RemoteMainSHA"
+    Write-Host ""
+    Write-Host "VERIFIED:"
+    Write-Host "  main SHA  == PROD SHA"
+    Write-Host "  main tree == PROD tree"
+    Write-Host "  main is locked"
+    Write-Host ""
+}
+catch {
+
+    Write-Host ""
+    Write-Host "======================================================"
+    Write-Host " ERROR"
+    Write-Host "======================================================"
+    Write-Host ""
+    Write-Host $_.Exception.Message
+
+
+    # ========================================================
+    # EMERGENCY RE-LOCK
+    #
+    # If anything fails after main was unlocked,
+    # attempt to lock it again before terminating.
+    # ========================================================
+
+    if ($MainUnlocked) {
+
+        Write-Host ""
+        Write-Host "Attempting emergency re-lock of main..."
+
+        try {
+
+            $EmergencyBody = @{
+                isLocked = $true
+            } | ConvertTo-Json
+
+
+            $EmergencyLock = Invoke-RestMethod `
+                -Uri $LockApi `
+                -Method PATCH `
+                -Headers $Headers `
+                -Body $EmergencyBody
+
+
+            if ($EmergencyLock.isLocked -eq $true) {
+
+                $MainUnlocked = $false
+
+                Write-Host "Emergency re-lock succeeded."
+
+            }
+            else {
+
+                Write-Host "WARNING: Azure DevOps did not confirm branch lock."
+            }
+
+        }
+        catch {
+
+            Write-Host ""
+            Write-Host "******************************************************"
+            Write-Host "CRITICAL WARNING"
+            Write-Host "******************************************************"
+            Write-Host "main could not be automatically re-locked."
+            Write-Host "Repository: $RepoName"
+            Write-Host "Manual intervention is required."
+            Write-Host "******************************************************"
+        }
+    }
+
+
+    exit 1
+}
+finally {
+
+    # ========================================================
+    # CLEAN TEMPORARY CLONE
+    # ========================================================
+
+    if ($LocationChanged) {
+
+        try {
+            Pop-Location
+        }
+        catch {
+        }
+    }
+
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($TempFolder) -and
+        (Test-Path $TempFolder)
+    ) {
+
+        Write-Host ""
+        Write-Host "Cleaning temporary repository clone:"
+        Write-Host "  $TempFolder"
+
+
+        Remove-Item `
+            $TempFolder `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+}

@@ -1,0 +1,598 @@
+# ResetDevelopFromMain.ps1
+#
+# Purpose:
+# For each repo in repo-list.txt:
+#
+#   1. Resolve repository by RepoId
+#   2. Read main branch
+#   3. Read develop branch
+#   4. If develop exists:
+#        - delete develop
+#        - recreate develop from exact main commit
+#   5. If develop does not exist:
+#        - create develop from exact main commit
+#   6. Verify final develop commit == main commit
+#
+# IMPORTANT:
+# - NO merge
+# - NO rebase
+# - NO cherry-pick
+# - develop becomes an exact branch pointer to current main
+#
+# SAFETY:
+# Start with:
+#   $DryRun = $true
+
+# ------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------
+
+$Pat = "YOUR_PAT"
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+$RepoListFile = ".\repo-list.txt"
+
+$MainBranch = "main"
+$DevelopBranch = "develop"
+
+$ApiVersion = "7.1"
+
+# ------------------------------------------------------------
+# SAFETY SWITCH
+# ------------------------------------------------------------
+
+$DryRun = $true
+
+# $true  = preview only
+# $false = perform actual delete/create
+
+# ------------------------------------------------------------
+# AUTHENTICATION
+# ------------------------------------------------------------
+
+$EncodedPat = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes(":$Pat")
+)
+
+$Headers = @{
+    Authorization = "Basic $EncodedPat"
+}
+
+# ------------------------------------------------------------
+# CONSTANTS / RESULTS
+# ------------------------------------------------------------
+
+$ZeroCommit = "0000000000000000000000000000000000000000"
+
+$Results = @()
+
+# ------------------------------------------------------------
+# HELPER:
+# Supports:
+#
+#   devops-cicd-test
+#
+# OR:
+#
+#   https://dev.azure.com/ORG/PROJECT/_git/devops-cicd-test
+# ------------------------------------------------------------
+
+function Get-RepoNameFromLine {
+    param(
+        [string]$Line
+    )
+
+    if ($null -eq $Line) {
+        return $null
+    }
+
+    $Line = $Line.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($Line)) {
+        return $null
+    }
+
+    if ($Line.StartsWith("#")) {
+        return $null
+    }
+
+    if ($Line -match '/_git/([^/?#]+)') {
+        return [uri]::UnescapeDataString($Matches[1])
+    }
+
+    return $Line
+}
+
+# ------------------------------------------------------------
+# HELPER:
+# Get exact branch ref
+# ------------------------------------------------------------
+
+function Get-BranchRef {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BranchName
+    )
+
+    $Filter = [uri]::EscapeDataString("heads/$BranchName")
+
+    $Uri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?filter=$Filter&api-version=$ApiVersion"
+
+    $Response = Invoke-RestMethod `
+        -Uri $Uri `
+        -Headers $Headers `
+        -Method Get `
+        -ErrorAction Stop
+
+    return $Response.value |
+        Where-Object {
+            $_.name -eq "refs/heads/$BranchName"
+        } |
+        Select-Object -First 1
+}
+
+# ------------------------------------------------------------
+# HELPER:
+# Update Azure DevOps Git ref
+#
+# Used for:
+# - deleting branch
+# - creating branch
+# ------------------------------------------------------------
+
+function Invoke-RefUpdate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoId,
+
+        [Parameter(Mandatory = $true)]
+        [array]$RefUpdateBody
+    )
+
+    $Uri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?api-version=$ApiVersion"
+
+    $JsonBody = ConvertTo-Json `
+        -InputObject $RefUpdateBody `
+        -Depth 10
+
+    Write-Host ""
+    Write-Host "Refs URI:"
+    Write-Host $Uri
+
+    Write-Host "Request Body:"
+    Write-Host $JsonBody
+
+    if ($DryRun) {
+        Write-Host "DRY RUN: no ref update performed."
+        return $null
+    }
+
+    $Response = Invoke-RestMethod `
+        -Uri $Uri `
+        -Headers $Headers `
+        -Method Post `
+        -ContentType "application/json" `
+        -Body $JsonBody `
+        -ErrorAction Stop
+
+    if (-not $Response.value) {
+        throw "Azure DevOps returned no ref update response."
+    }
+
+    foreach ($Item in $Response.value) {
+
+        if ($Item.success -ne $true) {
+
+            throw "Ref update failed for $($Item.name). Status: $($Item.updateStatus). Message: $($Item.customMessage)"
+        }
+    }
+
+    return $Response
+}
+
+# ------------------------------------------------------------
+# VERIFY REPO LIST
+# ------------------------------------------------------------
+
+if (-not (Test-Path $RepoListFile)) {
+
+    Write-Error "repo-list.txt not found: $RepoListFile"
+
+    exit 1
+}
+
+# ------------------------------------------------------------
+# LOAD REPOSITORY NAMES
+# ------------------------------------------------------------
+
+$RepoNames = @(
+    Get-Content $RepoListFile |
+        ForEach-Object {
+            Get-RepoNameFromLine $_
+        } |
+        Where-Object {
+            $_
+        } |
+        Select-Object -Unique
+)
+
+if (-not $RepoNames -or $RepoNames.Count -eq 0) {
+
+    Write-Error "No repositories found in $RepoListFile"
+
+    exit 1
+}
+
+Write-Host ""
+Write-Host "Repositories loaded:"
+
+$RepoNames |
+    ForEach-Object {
+        Write-Host " - $_"
+    }
+
+# ------------------------------------------------------------
+# LOAD ALL AZURE DEVOPS REPOSITORIES
+# ------------------------------------------------------------
+
+$ReposUri = "https://dev.azure.com/$Org/$Project/_apis/git/repositories?api-version=$ApiVersion"
+
+Write-Host ""
+Write-Host "Loading Azure DevOps repositories..."
+
+try {
+
+    $AllRepos = (
+        Invoke-RestMethod `
+            -Uri $ReposUri `
+            -Headers $Headers `
+            -Method Get `
+            -ErrorAction Stop
+    ).value
+}
+catch {
+
+    Write-Error "Unable to load Azure DevOps repositories: $($_.Exception.Message)"
+
+    exit 1
+}
+
+Write-Host "Azure Repos returned: $($AllRepos.Count)"
+
+# ------------------------------------------------------------
+# START
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "====================================================="
+Write-Host " RESET DEVELOP FROM MAIN"
+Write-Host "====================================================="
+Write-Host "Source branch : $MainBranch"
+Write-Host "Target branch : $DevelopBranch"
+Write-Host "Dry Run       : $DryRun"
+Write-Host "====================================================="
+
+# ------------------------------------------------------------
+# PROCESS EACH REPOSITORY
+# ------------------------------------------------------------
+
+foreach ($RepoName in $RepoNames) {
+
+    Write-Host ""
+    Write-Host "====================================================="
+    Write-Host "Processing: $RepoName"
+    Write-Host "====================================================="
+
+    try {
+
+        # ----------------------------------------------------
+        # STEP 1:
+        # Resolve repository object
+        # ----------------------------------------------------
+
+        $Repo = $AllRepos |
+            Where-Object {
+                $_.name -eq $RepoName
+            } |
+            Select-Object -First 1
+
+        if (-not $Repo) {
+
+            Write-Warning "Repo not found: $RepoName"
+
+            $Results += [PSCustomObject]@{
+                Repo               = $RepoName
+                RepoId             = ""
+                Status             = "SKIPPED"
+                Reason             = "Repo not found"
+                MainCommit         = ""
+                OldDevelopCommit   = ""
+                NewDevelopCommit   = ""
+            }
+
+            continue
+        }
+
+        $RepoId = $Repo.id
+
+        Write-Host "RepoId: $RepoId"
+
+        # ----------------------------------------------------
+        # STEP 2:
+        # Load main and develop refs
+        # ----------------------------------------------------
+
+        $MainRef = Get-BranchRef `
+            -RepoId $RepoId `
+            -BranchName $MainBranch
+
+        $DevelopRef = Get-BranchRef `
+            -RepoId $RepoId `
+            -BranchName $DevelopBranch
+
+        # ----------------------------------------------------
+        # STEP 3:
+        # main MUST exist
+        # ----------------------------------------------------
+
+        if (-not $MainRef) {
+
+            Write-Warning "main branch not found."
+
+            $Results += [PSCustomObject]@{
+                Repo               = $RepoName
+                RepoId             = $RepoId
+                Status             = "SKIPPED"
+                Reason             = "main branch not found"
+                MainCommit         = ""
+                OldDevelopCommit   = ""
+                NewDevelopCommit   = ""
+            }
+
+            continue
+        }
+
+        $MainCommit = $MainRef.objectId
+
+        Write-Host ""
+        Write-Host "main exists."
+        Write-Host "main commit: $MainCommit"
+
+        # ----------------------------------------------------
+        # STEP 4:
+        # Check existing develop
+        # ----------------------------------------------------
+
+        $OldDevelopCommit = ""
+
+        if ($DevelopRef) {
+
+            $OldDevelopCommit = $DevelopRef.objectId
+
+            Write-Host ""
+            Write-Host "develop exists."
+            Write-Host "Old develop commit: $OldDevelopCommit"
+
+            # ------------------------------------------------
+            # DELETE develop
+            #
+            # oldObjectId = current develop SHA
+            # newObjectId = zero SHA
+            # ------------------------------------------------
+
+            $DeleteDevelopBody = @(
+                @{
+                    name        = "refs/heads/$DevelopBranch"
+                    oldObjectId = $OldDevelopCommit
+                    newObjectId = $ZeroCommit
+                }
+            )
+
+            Write-Host ""
+            Write-Host "STEP 1: Delete develop"
+
+            Invoke-RefUpdate `
+                -RepoId $RepoId `
+                -RefUpdateBody $DeleteDevelopBody |
+                Out-Null
+        }
+        else {
+
+            Write-Host ""
+            Write-Host "develop branch does not exist."
+            Write-Host "Will create it from main."
+        }
+
+        # ----------------------------------------------------
+        # STEP 5:
+        # Create develop from exact main commit
+        #
+        # Creating a new branch requires:
+        #
+        # oldObjectId = zero SHA
+        # newObjectId = main SHA
+        # ----------------------------------------------------
+
+        $CreateDevelopBody = @(
+            @{
+                name        = "refs/heads/$DevelopBranch"
+                oldObjectId = $ZeroCommit
+                newObjectId = $MainCommit
+            }
+        )
+
+        Write-Host ""
+        Write-Host "STEP 2: Create develop from main"
+        Write-Host "main SHA -> $MainCommit"
+
+        Invoke-RefUpdate `
+            -RepoId $RepoId `
+            -RefUpdateBody $CreateDevelopBody |
+            Out-Null
+
+        # ----------------------------------------------------
+        # DRY RUN RESULT
+        # ----------------------------------------------------
+
+        if ($DryRun) {
+
+            $Reason = if ($DevelopRef) {
+                "Would delete develop and recreate from main"
+            }
+            else {
+                "Would create missing develop from main"
+            }
+
+            $Results += [PSCustomObject]@{
+                Repo               = $RepoName
+                RepoId             = $RepoId
+                Status             = "DRY RUN"
+                Reason             = $Reason
+                MainCommit         = $MainCommit
+                OldDevelopCommit   = $OldDevelopCommit
+                NewDevelopCommit   = $MainCommit
+            }
+
+            continue
+        }
+
+        # ----------------------------------------------------
+        # STEP 6:
+        # VERIFY develop exists after creation
+        # ----------------------------------------------------
+
+        Start-Sleep -Milliseconds 500
+
+        $NewDevelopRef = Get-BranchRef `
+            -RepoId $RepoId `
+            -BranchName $DevelopBranch
+
+        if (-not $NewDevelopRef) {
+
+            throw "develop was not found after creation."
+        }
+
+        $NewDevelopCommit = $NewDevelopRef.objectId
+
+        Write-Host ""
+        Write-Host "Verification:"
+        Write-Host "main commit        : $MainCommit"
+        Write-Host "new develop commit : $NewDevelopCommit"
+
+        # ----------------------------------------------------
+        # STEP 7:
+        # SHA safety verification
+        # ----------------------------------------------------
+
+        if ($NewDevelopCommit -ne $MainCommit) {
+
+            throw @"
+SAFETY CHECK FAILED.
+
+develop does not point to the same commit as main.
+
+main SHA:
+$MainCommit
+
+develop SHA:
+$NewDevelopCommit
+"@
+        }
+
+        Write-Host ""
+        Write-Host "SUCCESS:"
+        Write-Host "develop now exactly matches main."
+
+        # ----------------------------------------------------
+        # RESULT
+        # ----------------------------------------------------
+
+        $Reason = if ($DevelopRef) {
+            "develop deleted and recreated from main"
+        }
+        else {
+            "develop was missing; created from main"
+        }
+
+        $Results += [PSCustomObject]@{
+            Repo               = $RepoName
+            RepoId             = $RepoId
+            Status             = "SUCCESS"
+            Reason             = $Reason
+            MainCommit         = $MainCommit
+            OldDevelopCommit   = $OldDevelopCommit
+            NewDevelopCommit   = $NewDevelopCommit
+        }
+    }
+    catch {
+
+        $Message = $_.Exception.Message
+
+        if (
+            $_.ErrorDetails -and
+            $_.ErrorDetails.Message
+        ) {
+            $Message += " | Details: $($_.ErrorDetails.Message)"
+        }
+
+        Write-Warning "Failed: $RepoName - $Message"
+
+        $Results += [PSCustomObject]@{
+            Repo               = $RepoName
+            RepoId             = if ($RepoId) { $RepoId } else { "" }
+            Status             = "FAILED"
+            Reason             = $Message
+            MainCommit         = if ($MainCommit) { $MainCommit } else { "" }
+            OldDevelopCommit   = if ($OldDevelopCommit) { $OldDevelopCommit } else { "" }
+            NewDevelopCommit   = ""
+        }
+
+        continue
+    }
+}
+
+# ------------------------------------------------------------
+# EXPORT REPORT
+# ------------------------------------------------------------
+
+$Report = ".\reset-develop-from-main-results.csv"
+
+$Results |
+    Export-Csv `
+        -Path $Report `
+        -NoTypeInformation
+
+# ------------------------------------------------------------
+# FINAL DISPLAY
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "====================================================="
+Write-Host "FINAL RESULTS"
+Write-Host "====================================================="
+
+$Results |
+    Format-Table `
+        Repo,
+        Status,
+        MainCommit,
+        OldDevelopCommit,
+        NewDevelopCommit,
+        Reason `
+        -AutoSize
+
+Write-Host ""
+Write-Host "Completed."
+Write-Host "Report: $Report"
+
+if ($DryRun) {
+
+    Write-Host ""
+    Write-Host "DRY RUN ONLY."
+    Write-Host "No branches were deleted or created."
+}

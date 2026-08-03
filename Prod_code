@@ -1,0 +1,479 @@
+# Create-ProdCode-Branches.ps1
+# Purpose:
+# For each repo in repo-list.txt:
+#   1. Clone temporarily
+#   2. Find newest prod_* tag by tag date that is reachable from origin/main
+#   3. Get exact commit SHA behind that tag
+#   4. Create Prod_code from that exact SHA
+#   5. Verify Prod_code SHA == prod tag SHA
+#   6. Push Prod_code
+#   7. Delete temporary clone
+#
+# SAFETY:
+# Set $DryRun = $true first.
+# In dry-run mode, NOTHING is pushed or created remotely.
+
+$Pat = "YOUR_PAT"
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+$RepoListFile = ".\repo-list.txt"
+
+# ------------------------------------------------------------
+# SAFETY SWITCH
+# ------------------------------------------------------------
+
+$DryRun = $true
+
+# $true  = only show what WOULD happen
+# $false = actually create and push Prod_code
+
+# ------------------------------------------------------------
+# AUTHENTICATION
+# ------------------------------------------------------------
+
+$Auth = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes(":$Pat")
+)
+
+# ------------------------------------------------------------
+# LOAD REPOSITORIES
+# ------------------------------------------------------------
+
+if (-not (Test-Path $RepoListFile)) {
+    throw "Repo list file not found: $RepoListFile"
+}
+
+$Repos = Get-Content $RepoListFile |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -ne "" }
+
+if (-not $Repos) {
+    throw "No repositories found in $RepoListFile"
+}
+
+Write-Host ""
+Write-Host "==============================================="
+Write-Host " Prod_code Bulk Branch Creation"
+Write-Host "==============================================="
+Write-Host "Repositories : $($Repos.Count)"
+Write-Host "Dry Run      : $DryRun"
+Write-Host ""
+
+# ------------------------------------------------------------
+# SUMMARY
+# ------------------------------------------------------------
+
+$Results = @()
+
+# ------------------------------------------------------------
+# PROCESS EACH REPOSITORY
+# ------------------------------------------------------------
+
+foreach ($RepoName in $Repos) {
+
+    Write-Host ""
+    Write-Host "====================================================="
+    Write-Host "Processing repository: $RepoName"
+    Write-Host "====================================================="
+
+    $RepoUrl = "https://dev.azure.com/$Org/$Project/_git/$RepoName"
+
+    # Create unique temporary folder
+    $SafeRepoName = $RepoName -replace '[^a-zA-Z0-9._-]', '_'
+
+    $TempFolder = Join-Path `
+        $env:TEMP `
+        "ProdCode_$SafeRepoName_$([guid]::NewGuid().ToString('N'))"
+
+    $RepoResult = [PSCustomObject]@{
+        Repository = $RepoName
+        ProdTag    = ""
+        TagDate    = ""
+        TagSHA     = ""
+        BranchSHA  = ""
+        Status     = ""
+    }
+
+    $LocationChanged = $false
+
+    try {
+
+        # ----------------------------------------------------
+        # STEP 1: Clone repository
+        # ----------------------------------------------------
+
+        Write-Host "Cloning repository..."
+
+        git -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+            clone `
+            --quiet `
+            $RepoUrl `
+            $TempFolder
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Repository clone failed."
+        }
+
+        Push-Location $TempFolder
+        $LocationChanged = $true
+
+        # ----------------------------------------------------
+        # STEP 2: Fetch latest refs and tags
+        # ----------------------------------------------------
+
+        Write-Host "Fetching branches and tags..."
+
+        git -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+            fetch `
+            origin `
+            --prune `
+            --tags `
+            --force `
+            --quiet
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Git fetch failed."
+        }
+
+        # ----------------------------------------------------
+        # STEP 3: Verify origin/main exists
+        # ----------------------------------------------------
+
+        git rev-parse --verify "refs/remotes/origin/main" *> $null
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "origin/main does not exist."
+        }
+
+        # ----------------------------------------------------
+        # STEP 4: Find prod_* tags reachable from origin/main
+        #
+        # --merged guarantees the tag commit exists in
+        # origin/main history.
+        #
+        # --sort=-creatordate gives newest tag first.
+        # ----------------------------------------------------
+
+        $ProdTags = @(
+            git for-each-ref `
+                --merged="refs/remotes/origin/main" `
+                --sort=-creatordate `
+                --format="%(refname:short)|%(creatordate:iso8601-strict)" `
+                "refs/tags/prod_*"
+        )
+
+        if (-not $ProdTags -or $ProdTags.Count -eq 0) {
+
+            Write-Host "No prod_* tags found on origin/main."
+
+            $RepoResult.Status = "SKIPPED - No prod_* tag"
+
+            $Results += $RepoResult
+
+            continue
+        }
+
+        # ----------------------------------------------------
+        # STEP 5: Pick newest prod_* tag
+        # ----------------------------------------------------
+
+        $LatestTagLine = $ProdTags[0]
+
+        $Parts = $LatestTagLine -split '\|', 2
+
+        $LatestProdTag = $Parts[0]
+        $LatestProdDate = $Parts[1]
+
+        Write-Host ""
+        Write-Host "Latest PROD tag : $LatestProdTag"
+        Write-Host "Tag date        : $LatestProdDate"
+
+        $RepoResult.ProdTag = $LatestProdTag
+        $RepoResult.TagDate = $LatestProdDate
+
+        # ----------------------------------------------------
+        # STEP 6: Resolve tag to exact commit SHA
+        #
+        # ^{} dereferences annotated tags.
+        # ----------------------------------------------------
+
+        $TagSHA = (
+            git rev-parse "$LatestProdTag^{}"
+        ).Trim()
+
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($TagSHA)) {
+            throw "Unable to resolve $LatestProdTag to a commit."
+        }
+
+        Write-Host "PROD tag SHA    : $TagSHA"
+
+        $RepoResult.TagSHA = $TagSHA
+
+        # ----------------------------------------------------
+        # STEP 7: Extra safety check
+        # Confirm tag commit is actually ancestor of main
+        # ----------------------------------------------------
+
+        git merge-base `
+            --is-ancestor `
+            $TagSHA `
+            "refs/remotes/origin/main"
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "$LatestProdTag is not part of origin/main history."
+        }
+
+        Write-Host "Verified tag belongs to origin/main history."
+
+        # ----------------------------------------------------
+        # STEP 8: Check if Prod_code already exists remotely
+        # ----------------------------------------------------
+
+        git -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+            ls-remote `
+            --exit-code `
+            --heads `
+            origin `
+            "refs/heads/Prod_code" *> $null
+
+        $ProdCodeExists = ($LASTEXITCODE -eq 0)
+
+        if ($ProdCodeExists) {
+
+            Write-Host ""
+            Write-Host "Prod_code already exists remotely."
+
+            # Get existing remote branch SHA
+            $RemoteLine = (
+                git -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+                    ls-remote `
+                    --heads `
+                    origin `
+                    "refs/heads/Prod_code"
+            )
+
+            $ExistingSHA = ($RemoteLine -split '\s+')[0]
+
+            Write-Host "Existing Prod_code SHA : $ExistingSHA"
+            Write-Host "Expected PROD tag SHA  : $TagSHA"
+
+            $RepoResult.BranchSHA = $ExistingSHA
+
+            if ($ExistingSHA -eq $TagSHA) {
+
+                Write-Host "Already correct. No action needed."
+
+                $RepoResult.Status = "ALREADY MATCHES"
+
+            }
+            else {
+
+                Write-Host "WARNING: Existing Prod_code does NOT match latest PROD tag."
+
+                $RepoResult.Status = "SKIPPED - Branch already exists"
+
+            }
+
+            $Results += $RepoResult
+
+            continue
+        }
+
+        # ----------------------------------------------------
+        # DRY RUN
+        # ----------------------------------------------------
+
+        if ($DryRun) {
+
+            Write-Host ""
+            Write-Host "DRY RUN:"
+            Write-Host "Would create:"
+            Write-Host ""
+            Write-Host "  Prod_code -> $TagSHA"
+            Write-Host ""
+            Write-Host "from tag:"
+            Write-Host ""
+            Write-Host "  $LatestProdTag -> $TagSHA"
+
+            $RepoResult.BranchSHA = $TagSHA
+            $RepoResult.Status = "DRY RUN - READY"
+
+            $Results += $RepoResult
+
+            continue
+        }
+
+        # ----------------------------------------------------
+        # STEP 9: Create Prod_code locally directly from tag SHA
+        #
+        # IMPORTANT:
+        # No merge.
+        # No checkout from current main.
+        # No cherry-pick.
+        # ----------------------------------------------------
+
+        Write-Host ""
+        Write-Host "Creating Prod_code from exact PROD SHA..."
+
+        git branch Prod_code $TagSHA
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create local Prod_code branch."
+        }
+
+        # ----------------------------------------------------
+        # STEP 10: Verify local branch SHA
+        # ----------------------------------------------------
+
+        $BranchSHA = (
+            git rev-parse "Prod_code"
+        ).Trim()
+
+        $RepoResult.BranchSHA = $BranchSHA
+
+        Write-Host ""
+        Write-Host "Tag SHA        : $TagSHA"
+        Write-Host "Prod_code SHA  : $BranchSHA"
+
+        if ($BranchSHA -ne $TagSHA) {
+
+            throw @"
+SAFETY CHECK FAILED.
+
+Prod_code does not point to the same commit as the PROD tag.
+
+Tag SHA:
+$TagSHA
+
+Branch SHA:
+$BranchSHA
+
+Nothing will be pushed.
+"@
+        }
+
+        Write-Host ""
+        Write-Host "SHA verification PASSED."
+
+        # ----------------------------------------------------
+        # STEP 11: Push Prod_code
+        # ----------------------------------------------------
+
+        Write-Host "Pushing Prod_code..."
+
+        git -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+            push `
+            origin `
+            "Prod_code:refs/heads/Prod_code"
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to push Prod_code."
+        }
+
+        # ----------------------------------------------------
+        # STEP 12: Verify REMOTE branch after push
+        # ----------------------------------------------------
+
+        $RemoteLine = (
+            git -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+                ls-remote `
+                --heads `
+                origin `
+                "refs/heads/Prod_code"
+        )
+
+        if ([string]::IsNullOrWhiteSpace($RemoteLine)) {
+            throw "Prod_code push completed but remote verification failed."
+        }
+
+        $RemoteSHA = ($RemoteLine -split '\s+')[0]
+
+        Write-Host ""
+        Write-Host "Remote Prod_code SHA : $RemoteSHA"
+        Write-Host "PROD tag SHA         : $TagSHA"
+
+        if ($RemoteSHA -ne $TagSHA) {
+            throw "Remote Prod_code SHA does not match PROD tag SHA."
+        }
+
+        Write-Host ""
+        Write-Host "SUCCESS:"
+        Write-Host "Prod_code exactly matches $LatestProdTag"
+
+        $RepoResult.BranchSHA = $RemoteSHA
+        $RepoResult.Status = "SUCCESS"
+
+        $Results += $RepoResult
+    }
+    catch {
+
+        Write-Host ""
+        Write-Host "ERROR: $($_.Exception.Message)"
+
+        $RepoResult.Status = "ERROR - $($_.Exception.Message)"
+
+        $Results += $RepoResult
+    }
+    finally {
+
+        # ----------------------------------------------------
+        # RETURN FROM TEMP DIRECTORY
+        # ----------------------------------------------------
+
+        if ($LocationChanged) {
+            Pop-Location
+        }
+
+        # ----------------------------------------------------
+        # DELETE TEMPORARY CLONE
+        # ----------------------------------------------------
+
+        if (Test-Path $TempFolder) {
+
+            Remove-Item `
+                $TempFolder `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# FINAL REPORT
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host ""
+Write-Host "====================================================="
+Write-Host "FINAL RESULTS"
+Write-Host "====================================================="
+
+$Results | Format-Table `
+    Repository,
+    ProdTag,
+    TagDate,
+    TagSHA,
+    BranchSHA,
+    Status `
+    -AutoSize
+
+Write-Host ""
+
+if ($DryRun) {
+    Write-Host "DRY RUN COMPLETE."
+    Write-Host "No remote branches were created."
+}
+else {
+    Write-Host "EXECUTION COMPLETE."
+}
+
+
+What does this code do? 
+
+What i want? 
+To create a branch called PROD_Code off of latest tag that is deployed to PROD sorting with latest date  and tag starts with prod* and should be from main branch.  That branch should be complete replica of that tag code that is deployed to prod. Not merging 
+
+Does this code satisfy the requirement

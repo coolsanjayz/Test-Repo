@@ -1,0 +1,667 @@
+# ============================================================
+# Sync-Dev-Code-To-Deployed.ps1
+#
+# DEV TEST
+#
+# After a successful DEV deployment:
+#
+#      Exact deployed artifact commit
+#                   |
+#                   v
+#               Dev_Code
+#
+# Dev_Code becomes the exact Git snapshot represented by
+# BUILD_SOURCEVERSION.
+#
+# NO MERGE
+# NO REBASE
+# NO CHERRY-PICK
+# ============================================================
+
+$ErrorActionPreference = "Stop"
+
+# ------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+$TargetBranch = "Dev_Code"
+$EnvironmentName = "DEV"
+
+# ------------------------------------------------------------
+# CLASSIC RELEASE / BUILD ENVIRONMENT VARIABLES
+# ------------------------------------------------------------
+
+$BuildId      = $env:BUILD_BUILDID
+$DeployedSHA  = $env:BUILD_SOURCEVERSION
+$RepoName     = $env:BUILD_REPOSITORY_NAME
+$RepoId       = $env:BUILD_REPOSITORY_ID
+$AgentTemp    = $env:AGENT_TEMPDIRECTORY
+$Token        = $env:SYSTEM_ACCESSTOKEN
+
+# ------------------------------------------------------------
+# VALIDATE VARIABLES
+# ------------------------------------------------------------
+
+if ([string]::IsNullOrWhiteSpace($BuildId)) {
+    throw "BUILD_BUILDID is empty."
+}
+
+if ([string]::IsNullOrWhiteSpace($DeployedSHA)) {
+    throw "BUILD_SOURCEVERSION is empty."
+}
+
+if ([string]::IsNullOrWhiteSpace($RepoName)) {
+    throw @"
+BUILD_REPOSITORY_NAME is empty.
+
+The Classic Release did not expose the application
+repository name through this variable.
+"@
+}
+
+if ([string]::IsNullOrWhiteSpace($RepoId)) {
+    throw @"
+BUILD_REPOSITORY_ID is empty.
+
+The Classic Release did not expose the application
+repository ID through this variable.
+"@
+}
+
+if ([string]::IsNullOrWhiteSpace($AgentTemp)) {
+    throw "AGENT_TEMPDIRECTORY is empty."
+}
+
+if ([string]::IsNullOrWhiteSpace($Token)) {
+    throw @"
+SYSTEM_ACCESSTOKEN is empty.
+
+Verify that the Classic Release Agent Job allows
+scripts to access the OAuth token.
+"@
+}
+
+# ------------------------------------------------------------
+# AUTHENTICATION
+# ------------------------------------------------------------
+
+$Auth = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes(":$Token")
+)
+
+$Headers = @{
+    Authorization  = "Basic $Auth"
+    "Content-Type" = "application/json"
+}
+
+# ------------------------------------------------------------
+# DISPLAY RESOLVED VALUES
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "======================================================"
+Write-Host " $EnvironmentName -> $TargetBranch EXACT SYNC"
+Write-Host "======================================================"
+Write-Host "Build ID            : $BuildId"
+Write-Host "Repository Name     : $RepoName"
+Write-Host "Repository ID       : $RepoId"
+Write-Host "Deployed Source SHA : $DeployedSHA"
+Write-Host "Target Branch       : $TargetBranch"
+Write-Host "Agent Temp          : $AgentTemp"
+Write-Host ""
+
+# ------------------------------------------------------------
+# REPOSITORY URL
+# ------------------------------------------------------------
+
+$RepoUrl = "https://dev.azure.com/$Org/$Project/_git/$RepoName"
+
+# ------------------------------------------------------------
+# LOCK / UNLOCK API
+#
+# Azure DevOps Update Ref API supports locking/unlocking refs.
+# ------------------------------------------------------------
+
+$LockApi = "https://dev.azure.com/$Org/$Project/_apis/git/repositories/$RepoId/refs?filter=heads/$TargetBranch&api-version=7.1"
+
+# ------------------------------------------------------------
+# TEMPORARY CLONE DIRECTORY
+# ------------------------------------------------------------
+
+$SafeRepoName = $RepoName -replace '[^a-zA-Z0-9._-]', '_'
+
+$TempFolder = Join-Path `
+    $AgentTemp `
+    "DevCodeSync_${SafeRepoName}_$([guid]::NewGuid().ToString('N'))"
+
+Write-Host "Temporary clone:"
+Write-Host "  $TempFolder"
+Write-Host ""
+
+$LocationChanged = $false
+$BranchUnlocked  = $false
+
+try {
+
+    # ========================================================
+    # STEP 1 - CLONE APPLICATION REPOSITORY
+    # ========================================================
+
+    Write-Host "------------------------------------------------------"
+    Write-Host "STEP 1 - Clone application repository"
+    Write-Host "------------------------------------------------------"
+
+    git `
+        -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+        clone `
+        --quiet `
+        --no-checkout `
+        $RepoUrl `
+        $TempFolder
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Repository clone failed for '$RepoName'."
+    }
+
+    Push-Location $TempFolder
+    $LocationChanged = $true
+
+    # ========================================================
+    # STEP 2 - FETCH REFS AND TAGS
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------"
+    Write-Host "STEP 2 - Fetch refs and tags"
+    Write-Host "------------------------------------------------------"
+
+    git `
+        -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+        fetch `
+        origin `
+        --prune `
+        --tags `
+        --force `
+        --quiet
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git fetch failed."
+    }
+
+    # ========================================================
+    # STEP 3 - VERIFY Dev_Code EXISTS
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------"
+    Write-Host "STEP 3 - Verify $TargetBranch exists"
+    Write-Host "------------------------------------------------------"
+
+    git rev-parse `
+        --verify `
+        "refs/remotes/origin/$TargetBranch" *> $null
+
+    if ($LASTEXITCODE -ne 0) {
+        throw @"
+Remote branch '$TargetBranch' does not exist.
+
+Create '$TargetBranch' before running this sync.
+"@
+    }
+
+    Write-Host "$TargetBranch exists."
+
+    # ========================================================
+    # STEP 4 - VERIFY DEPLOYED COMMIT EXISTS
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------"
+    Write-Host "STEP 4 - Verify deployed commit"
+    Write-Host "------------------------------------------------------"
+
+    git cat-file `
+        -e `
+        "$DeployedSHA^{commit}" 2>$null
+
+    if ($LASTEXITCODE -ne 0) {
+
+        Write-Host "Commit not currently available locally."
+        Write-Host "Trying direct fetch of deployed SHA..."
+
+        git `
+            -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+            fetch `
+            origin `
+            $DeployedSHA `
+            --quiet
+
+        if ($LASTEXITCODE -ne 0) {
+            throw @"
+Unable to fetch deployed commit:
+
+$DeployedSHA
+
+Repository:
+$RepoName
+"@
+        }
+
+        git cat-file `
+            -e `
+            "$DeployedSHA^{commit}" 2>$null
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Deployed SHA '$DeployedSHA' is not available as a Git commit."
+        }
+    }
+
+    $DeployedFullSHA = (
+        git rev-parse "$DeployedSHA^{commit}"
+    ).Trim()
+
+    Write-Host "Exact deployed SHA:"
+    Write-Host "  $DeployedFullSHA"
+
+    # ========================================================
+    # STEP 5 - READ CURRENT Dev_Code SHA
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------"
+    Write-Host "STEP 5 - Read current $TargetBranch"
+    Write-Host "------------------------------------------------------"
+
+    $CurrentBranchSHA = (
+        git rev-parse "refs/remotes/origin/$TargetBranch"
+    ).Trim()
+
+    Write-Host "Current $TargetBranch : $CurrentBranchSHA"
+    Write-Host "Deployed DEV commit   : $DeployedFullSHA"
+
+    # ========================================================
+    # STEP 6 - ALREADY MATCHES?
+    # ========================================================
+
+    if ($CurrentBranchSHA -eq $DeployedFullSHA) {
+
+        Write-Host ""
+        Write-Host "======================================================"
+        Write-Host " NO CHANGE REQUIRED"
+        Write-Host "======================================================"
+        Write-Host "$TargetBranch already matches deployed DEV exactly."
+        Write-Host ""
+
+        return
+    }
+
+    # ========================================================
+    # STEP 7 - DETERMINE DIRECTION
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------"
+    Write-Host "STEP 7 - Determine synchronization direction"
+    Write-Host "------------------------------------------------------"
+
+    git merge-base `
+        --is-ancestor `
+        $CurrentBranchSHA `
+        $DeployedFullSHA
+
+    if ($LASTEXITCODE -eq 0) {
+
+        Write-Host "Direction: FORWARD"
+    }
+    else {
+
+        git merge-base `
+            --is-ancestor `
+            $DeployedFullSHA `
+            $CurrentBranchSHA
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Direction: ROLLBACK / OLDER DEPLOYMENT"
+        }
+        else {
+            Write-Host "Direction: DIVERGED HISTORY"
+            Write-Host "$TargetBranch will still be synchronized exactly."
+        }
+    }
+
+    # ========================================================
+    # STEP 8 - UNLOCK Dev_Code
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------"
+    Write-Host "STEP 8 - Unlock $TargetBranch"
+    Write-Host "------------------------------------------------------"
+
+    $UnlockBody = @{
+        isLocked = $false
+    } | ConvertTo-Json
+
+    try {
+
+        $UnlockResult = Invoke-RestMethod `
+            -Uri $LockApi `
+            -Method PATCH `
+            -Headers $Headers `
+            -Body $UnlockBody
+    }
+    catch {
+
+        throw @"
+Unable to unlock '$TargetBranch'.
+
+Check Build Service branch permissions.
+
+Error:
+$($_.Exception.Message)
+"@
+    }
+
+    if ($UnlockResult.isLocked -eq $true) {
+        throw "'$TargetBranch' still reports as locked."
+    }
+
+    $BranchUnlocked = $true
+
+    Write-Host "$TargetBranch unlocked."
+
+    # ========================================================
+    # STEP 9 - REFRESH TARGET BRANCH IMMEDIATELY BEFORE PUSH
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------"
+    Write-Host "STEP 9 - Refresh $TargetBranch"
+    Write-Host "------------------------------------------------------"
+
+    git `
+        -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+        fetch `
+        origin `
+        "+refs/heads/${TargetBranch}:refs/remotes/origin/$TargetBranch" `
+        --quiet
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to refresh '$TargetBranch'."
+    }
+
+    $CurrentBranchSHA = (
+        git rev-parse "refs/remotes/origin/$TargetBranch"
+    ).Trim()
+
+    Write-Host "$TargetBranch immediately before sync:"
+    Write-Host "  $CurrentBranchSHA"
+
+    # ========================================================
+    # STEP 10 - EXACT SYNCHRONIZATION
+    #
+    # NO MERGE.
+    #
+    # force-with-lease makes sure Dev_Code has not changed
+    # after our final fetch.
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------"
+    Write-Host "STEP 10 - Synchronize $TargetBranch"
+    Write-Host "------------------------------------------------------"
+
+    Write-Host "FROM:"
+    Write-Host "  $CurrentBranchSHA"
+
+    Write-Host "TO:"
+    Write-Host "  $DeployedFullSHA"
+
+    git `
+        -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+        push `
+        "--force-with-lease=refs/heads/${TargetBranch}:$CurrentBranchSHA" `
+        origin `
+        "${DeployedFullSHA}:refs/heads/$TargetBranch"
+
+    if ($LASTEXITCODE -ne 0) {
+
+        throw @"
+$TargetBranch synchronization FAILED.
+
+Possible causes:
+
+1. Build Service does not have Force push.
+2. Build Service does not have Bypass policies when pushing.
+3. $TargetBranch changed after final fetch.
+4. Branch could not actually be unlocked.
+5. Authentication failed.
+"@
+    }
+
+    # ========================================================
+    # STEP 11 - VERIFY REMOTE Dev_Code SHA
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------"
+    Write-Host "STEP 11 - Verify remote $TargetBranch"
+    Write-Host "------------------------------------------------------"
+
+    $RemoteBranchLine = git `
+        -c "http.extraheader=AUTHORIZATION: Basic $Auth" `
+        ls-remote `
+        --heads `
+        origin `
+        "refs/heads/$TargetBranch"
+
+    if ([string]::IsNullOrWhiteSpace($RemoteBranchLine)) {
+        throw "Unable to retrieve remote '$TargetBranch'."
+    }
+
+    $RemoteBranchSHA = (
+        $RemoteBranchLine -split '\s+'
+    )[0].Trim()
+
+    Write-Host "Deployed DEV SHA : $DeployedFullSHA"
+    Write-Host "$TargetBranch SHA : $RemoteBranchSHA"
+
+    if ($RemoteBranchSHA -ne $DeployedFullSHA) {
+
+        throw @"
+CRITICAL VERIFICATION FAILURE.
+
+$TargetBranch does not match the deployed DEV commit.
+
+Deployed:
+$DeployedFullSHA
+
+Remote:
+$RemoteBranchSHA
+"@
+    }
+
+    # ========================================================
+    # STEP 12 - VERIFY EXACT GIT TREE
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------"
+    Write-Host "STEP 12 - Verify exact repository snapshot"
+    Write-Host "------------------------------------------------------"
+
+    $DeployedTreeSHA = (
+        git rev-parse "$DeployedFullSHA^{tree}"
+    ).Trim()
+
+    $BranchTreeSHA = (
+        git rev-parse "$RemoteBranchSHA^{tree}"
+    ).Trim()
+
+    Write-Host "Deployed tree      : $DeployedTreeSHA"
+    Write-Host "$TargetBranch tree : $BranchTreeSHA"
+
+    if ($DeployedTreeSHA -ne $BranchTreeSHA) {
+        throw "'$TargetBranch' tree does not match deployed DEV."
+    }
+
+    Write-Host "Commit verification : PASSED"
+    Write-Host "Tree verification   : PASSED"
+
+    # ========================================================
+    # STEP 13 - LOCK Dev_Code AGAIN
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------"
+    Write-Host "STEP 13 - Lock $TargetBranch"
+    Write-Host "------------------------------------------------------"
+
+    $LockBody = @{
+        isLocked = $true
+    } | ConvertTo-Json
+
+    try {
+
+        $LockResult = Invoke-RestMethod `
+            -Uri $LockApi `
+            -Method PATCH `
+            -Headers $Headers `
+            -Body $LockBody
+    }
+    catch {
+
+        throw @"
+Synchronization succeeded, but '$TargetBranch'
+could not be locked again.
+
+Repository:
+$RepoName
+
+SHA:
+$RemoteBranchSHA
+
+Error:
+$($_.Exception.Message)
+"@
+    }
+
+    if ($LockResult.isLocked -ne $true) {
+        throw "Azure DevOps did not confirm '$TargetBranch' was locked."
+    }
+
+    $BranchUnlocked = $false
+
+    # ========================================================
+    # SUCCESS
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "======================================================"
+    Write-Host " SUCCESS"
+    Write-Host "======================================================"
+
+    Write-Host "Repository          : $RepoName"
+    Write-Host "Environment         : $EnvironmentName"
+    Write-Host "Deployed SHA        : $DeployedFullSHA"
+    Write-Host "$TargetBranch SHA   : $RemoteBranchSHA"
+    Write-Host ""
+
+    Write-Host "VERIFIED:"
+    Write-Host "  $TargetBranch SHA  == deployed DEV SHA"
+    Write-Host "  $TargetBranch tree == deployed DEV tree"
+    Write-Host "  $TargetBranch is locked"
+    Write-Host ""
+}
+catch {
+
+    Write-Host ""
+    Write-Host "======================================================"
+    Write-Host " ERROR"
+    Write-Host "======================================================"
+    Write-Host $_.Exception.Message
+
+    # ========================================================
+    # EMERGENCY RE-LOCK
+    # ========================================================
+
+    if ($BranchUnlocked) {
+
+        Write-Host ""
+        Write-Host "Attempting emergency re-lock of '$TargetBranch'..."
+
+        try {
+
+            $EmergencyLockBody = @{
+                isLocked = $true
+            } | ConvertTo-Json
+
+            $EmergencyResult = Invoke-RestMethod `
+                -Uri $LockApi `
+                -Method PATCH `
+                -Headers $Headers `
+                -Body $EmergencyLockBody
+
+            if ($EmergencyResult.isLocked -eq $true) {
+
+                $BranchUnlocked = $false
+                Write-Host "Emergency re-lock succeeded."
+            }
+            else {
+
+                Write-Host "WARNING: Azure DevOps did not confirm branch lock."
+            }
+        }
+        catch {
+
+            Write-Host ""
+            Write-Host "******************************************************"
+            Write-Host "CRITICAL WARNING"
+            Write-Host "******************************************************"
+            Write-Host "'$TargetBranch' could not be automatically re-locked."
+            Write-Host "Repository: $RepoName"
+            Write-Host "Manual intervention is required."
+            Write-Host "******************************************************"
+        }
+    }
+
+    exit 1
+}
+finally {
+
+    # ========================================================
+    # RETURN FROM TEMP REPOSITORY
+    # ========================================================
+
+    if ($LocationChanged) {
+
+        try {
+            Pop-Location
+        }
+        catch {
+        }
+    }
+
+    # ========================================================
+    # DELETE TEMP CLONE
+    # ========================================================
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($TempFolder) -and
+        (Test-Path $TempFolder)
+    ) {
+
+        Write-Host ""
+        Write-Host "Cleaning temporary clone:"
+        Write-Host "  $TempFolder"
+
+        Remove-Item `
+            $TempFolder `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+}

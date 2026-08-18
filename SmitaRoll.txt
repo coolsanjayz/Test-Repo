@@ -1,0 +1,1268 @@
+# ============================================================
+# rollout_dev.ps1
+#
+# INPUT:
+# repo-list.txt contains ONE Azure Repos URL per line.
+#
+# Example:
+# https://dev.azure.com/WTFC-DataManagement/CODE-MuleSoftESB/_git/sch-b2b-achwire2bai2
+#
+#
+# FOR EACH URL:
+#
+# 1. Parse repository name
+# 2. Resolve actual repository GUID
+# 3. Resolve project GUID
+# 4. Find Build definition(s) using that repository
+# 5. Find Classic Release definition using those Build defs
+# 6. Require ONE unique matching Classic Release
+# 7. Find DEV
+# 8. Find DEV Agent Job
+# 9. Copy an existing PowerShell v2 task
+# 10. Change copy to "Sync Dev_Code to Dev"
+# 11. Append as LAST DEV task
+# 12. Backup original release definition
+# 13. Save
+# 14. Read back and verify
+#
+# ============================================================
+
+$ErrorActionPreference = "Stop"
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+$Org = "WTFC-DataManagement"
+$Project = "CODE-MuleSoftESB"
+
+$RepoListFile = ".\repo-list.txt"
+
+# PAT needs:
+# - Code Read
+# - Build Read
+# - Release Read/Manage
+$Pat = "YOUR_PAT"
+
+# ALWAYS START TRUE
+$DryRun = $true
+
+$EnvironmentName = "DEV"
+
+$TaskDisplayName = "Sync Dev_Code to Dev"
+
+$CentralScriptPath = `
+    "mulesoft-pipelines/release-pipelines/scripts/Sync-Main-To-Prod.ps1"
+
+# PowerShell v2 task GUID
+$PowerShellTaskId = `
+    "e213ff0f-5d5c-4791-802d-52ea3e7be1f1"
+
+
+# ============================================================
+# HELPER - SET/ADD OBJECT PROPERTY
+# ============================================================
+
+function Set-ObjectProperty {
+
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Object,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        $Value
+    )
+
+    if ($Object.PSObject.Properties.Name -contains $Name) {
+
+        $Object.$Name = $Value
+    }
+    else {
+
+        $Object |
+            Add-Member `
+                -MemberType NoteProperty `
+                -Name $Name `
+                -Value $Value
+    }
+}
+
+
+# ============================================================
+# VALIDATE PAT
+# ============================================================
+
+if (
+    [string]::IsNullOrWhiteSpace($Pat) -or
+    $Pat -eq "YOUR_PAT"
+) {
+    throw "Set the PAT before running this script."
+}
+
+
+# ============================================================
+# VALIDATE REPO LIST
+# ============================================================
+
+if (-not (Test-Path $RepoListFile)) {
+
+    throw "repo-list.txt not found: $RepoListFile"
+}
+
+
+$RepoUrls = @(
+
+    Get-Content $RepoListFile |
+
+        ForEach-Object {
+            $_.Trim()
+        } |
+
+        Where-Object {
+            $_ -ne "" -and
+            -not $_.StartsWith("#")
+        }
+)
+
+
+if ($RepoUrls.Count -eq 0) {
+
+    throw "repo-list.txt contains no repository URLs."
+}
+
+
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+
+$Auth = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes(":$Pat")
+)
+
+
+$Headers = @{
+    Authorization  = "Basic $Auth"
+    "Content-Type" = "application/json"
+}
+
+
+# ============================================================
+# API BASE
+# ============================================================
+
+$EncodedProject = [uri]::EscapeDataString($Project)
+
+
+$GitApiBase = `
+    "https://dev.azure.com/$Org/$EncodedProject/_apis/git"
+
+
+$BuildApiBase = `
+    "https://dev.azure.com/$Org/$EncodedProject/_apis/build"
+
+
+$ReleaseApiBase = `
+    "https://vsrm.dev.azure.com/$Org/$EncodedProject/_apis/release"
+
+
+# ============================================================
+# BACKUP DIRECTORY
+# ============================================================
+
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+
+$BackupDirectory = Join-Path `
+    $PSScriptRoot `
+    "ReleaseDefinitionBackup_$Timestamp"
+
+
+New-Item `
+    -ItemType Directory `
+    -Path $BackupDirectory `
+    -Force |
+    Out-Null
+
+
+# ============================================================
+# RESULTS
+# ============================================================
+
+$Results = @()
+
+
+Write-Host ""
+Write-Host "======================================================"
+Write-Host " SELECTED DEV CLASSIC RELEASE ROLLOUT"
+Write-Host "======================================================"
+Write-Host "Organization : $Org"
+Write-Host "Project      : $Project"
+Write-Host "Repos        : $($RepoUrls.Count)"
+Write-Host "Environment  : $EnvironmentName"
+Write-Host "Dry Run      : $DryRun"
+Write-Host "Backup       : $BackupDirectory"
+Write-Host ""
+
+
+# ============================================================
+# PROCESS EACH REPOSITORY URL
+# ============================================================
+
+foreach ($RepoUrl in $RepoUrls) {
+
+    Write-Host ""
+    Write-Host "======================================================"
+    Write-Host "INPUT URL:"
+    Write-Host "$RepoUrl"
+    Write-Host "======================================================"
+
+
+    $Result = [PSCustomObject]@{
+        RepoUrl            = $RepoUrl
+        Repository         = ""
+        RepoId             = ""
+        BuildDefinitionId  = ""
+        ReleaseDefinition  = ""
+        ReleaseDefinitionId = ""
+        DevFound           = $false
+        ExistingTask       = $false
+        Action             = ""
+        Status             = ""
+    }
+
+
+    try {
+
+        # ====================================================
+        # STEP 1 - PARSE REPOSITORY NAME FROM URL
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 1 - Parsing repository URL..."
+
+
+        try {
+            $Uri = [uri]$RepoUrl
+        }
+        catch {
+            throw "Invalid repository URL: $RepoUrl"
+        }
+
+
+        $PathParts = @(
+            $Uri.AbsolutePath.Trim("/") -split "/"
+        )
+
+
+        $GitIndex = [Array]::IndexOf(
+            $PathParts,
+            "_git"
+        )
+
+
+        if (
+            $GitIndex -lt 0 -or
+            $GitIndex + 1 -ge $PathParts.Count
+        ) {
+
+            throw @"
+Unable to extract repository name from:
+
+$RepoUrl
+
+Expected Azure Repos URL containing:
+/_git/<repository-name>
+"@
+        }
+
+
+        $RepoName = `
+            [uri]::UnescapeDataString(
+                $PathParts[$GitIndex + 1]
+            )
+
+
+        if ([string]::IsNullOrWhiteSpace($RepoName)) {
+
+            throw "Repository name parsed as empty."
+        }
+
+
+        $Result.Repository = $RepoName
+
+
+        Write-Host "Repository Name : $RepoName"
+
+
+        # ====================================================
+        # STEP 2 - RESOLVE REAL REPOSITORY GUID
+        #
+        # Azure DevOps Git repository GET accepts repo name
+        # or repository ID.
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 2 - Resolving repository ID..."
+
+
+        $EncodedRepoName = `
+            [uri]::EscapeDataString($RepoName)
+
+
+        $RepositoryUrl = `
+            "$GitApiBase/repositories/$EncodedRepoName?api-version=7.1"
+
+
+        $Repository = Invoke-RestMethod `
+            -Uri $RepositoryUrl `
+            -Method GET `
+            -Headers $Headers
+
+
+        if ($null -eq $Repository) {
+
+            throw "Repository '$RepoName' could not be resolved."
+        }
+
+
+        $RepoId = $Repository.id
+        $ResolvedRepoName = $Repository.name
+        $ProjectId = $Repository.project.id
+
+
+        if ([string]::IsNullOrWhiteSpace($RepoId)) {
+
+            throw "Repository GUID is empty."
+        }
+
+
+        if ([string]::IsNullOrWhiteSpace($ProjectId)) {
+
+            throw "Project GUID could not be determined."
+        }
+
+
+        $Result.RepoId = $RepoId
+
+
+        Write-Host "Resolved Name : $ResolvedRepoName"
+        Write-Host "Repository ID : $RepoId"
+        Write-Host "Project ID    : $ProjectId"
+
+
+        # ====================================================
+        # STEP 3 - VERIFY REPOSITORY NAME
+        # ====================================================
+
+        if ($ResolvedRepoName -ne $RepoName) {
+
+            throw @"
+Repository name validation failed.
+
+URL says:
+$RepoName
+
+Azure DevOps resolved:
+$ResolvedRepoName
+"@
+        }
+
+
+        # ====================================================
+        # STEP 4 - FIND BUILD DEFINITIONS USING REPOSITORY
+        #
+        # Azure Build Definitions API supports repositoryId.
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 4 - Finding Build definitions..."
+
+
+        $BuildDefinitionsUrl = `
+            "$BuildApiBase/definitions" +
+            "?repositoryId=$RepoId" +
+            "&repositoryType=TfsGit" +
+            "&`$top=100" +
+            "&api-version=7.1"
+
+
+        $BuildDefinitionsResponse = Invoke-RestMethod `
+            -Uri $BuildDefinitionsUrl `
+            -Method GET `
+            -Headers $Headers
+
+
+        $BuildDefinitions = @(
+            $BuildDefinitionsResponse.value
+        )
+
+
+        if ($BuildDefinitions.Count -eq 0) {
+
+            throw @"
+No Build definition found using repository:
+
+$RepoName
+$RepoId
+"@
+        }
+
+
+        Write-Host "Build definitions found:"
+        Write-Host ""
+
+
+        foreach ($BuildDefinition in $BuildDefinitions) {
+
+            Write-Host `
+                "  ID=$($BuildDefinition.id)  Name=$($BuildDefinition.name)"
+        }
+
+
+        # ====================================================
+        # STEP 5 - FIND CLASSIC RELEASE DEFINITIONS
+        #
+        # Release artifactSourceId for a Build artifact:
+        #
+        # ProjectGuid:BuildDefinitionId
+        #
+        # We test every Build definition associated with this
+        # repository.
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 5 - Finding Classic Release definition..."
+
+
+        $ReleaseMatches = @()
+
+
+        foreach ($BuildDefinition in $BuildDefinitions) {
+
+            $BuildDefinitionId = $BuildDefinition.id
+
+
+            $ArtifactSourceId = `
+                "${ProjectId}:$BuildDefinitionId"
+
+
+            $EncodedArtifactSourceId = `
+                [uri]::EscapeDataString($ArtifactSourceId)
+
+
+            $ReleaseSearchUrl = `
+                "$ReleaseApiBase/definitions" +
+                "?artifactType=Build" +
+                "&artifactSourceId=$EncodedArtifactSourceId" +
+                "&`$top=100" +
+                "&api-version=7.1"
+
+
+            $ReleaseSearchResult = Invoke-RestMethod `
+                -Uri $ReleaseSearchUrl `
+                -Method GET `
+                -Headers $Headers
+
+
+            foreach ($ReleaseDefinition in @($ReleaseSearchResult.value)) {
+
+                $ReleaseMatches += [PSCustomObject]@{
+                    ReleaseDefinitionId   = $ReleaseDefinition.id
+                    ReleaseDefinitionName = $ReleaseDefinition.name
+                    BuildDefinitionId     = $BuildDefinitionId
+                    BuildDefinitionName   = $BuildDefinition.name
+                }
+            }
+        }
+
+
+        # ----------------------------------------------------
+        # REMOVE DUPLICATE RELEASE DEFINITIONS
+        # ----------------------------------------------------
+
+        $ReleaseMatches = @(
+
+            $ReleaseMatches |
+
+                Sort-Object ReleaseDefinitionId -Unique
+        )
+
+
+        if ($ReleaseMatches.Count -eq 0) {
+
+            throw @"
+No Classic Release definition was found whose
+Build artifact maps to repository:
+
+$RepoName
+"@
+        }
+
+
+        # ----------------------------------------------------
+        # IMPORTANT SAFETY CHECK
+        #
+        # We don't guess if multiple releases use the repo.
+        # ----------------------------------------------------
+
+        if ($ReleaseMatches.Count -gt 1) {
+
+            Write-Host ""
+            Write-Host "Multiple Classic Release definitions found:"
+            Write-Host ""
+
+
+            foreach ($Match in $ReleaseMatches) {
+
+                Write-Host `
+                    "  Release ID=$($Match.ReleaseDefinitionId)" `
+                    "Name=$($Match.ReleaseDefinitionName)"
+            }
+
+
+            throw @"
+More than one Classic Release definition maps to
+repository '$RepoName'.
+
+No change made.
+
+Resolve the ambiguity before rollout.
+"@
+        }
+
+
+        $ReleaseMatch = $ReleaseMatches[0]
+
+
+        $DefinitionId = `
+            $ReleaseMatch.ReleaseDefinitionId
+
+
+        $DefinitionName = `
+            $ReleaseMatch.ReleaseDefinitionName
+
+
+        $MatchedBuildDefinitionId = `
+            $ReleaseMatch.BuildDefinitionId
+
+
+        $Result.ReleaseDefinition = $DefinitionName
+        $Result.ReleaseDefinitionId = $DefinitionId
+        $Result.BuildDefinitionId = $MatchedBuildDefinitionId
+
+
+        Write-Host ""
+        Write-Host "MATCH VERIFIED:"
+        Write-Host "Repository             : $RepoName"
+        Write-Host "Repository ID          : $RepoId"
+        Write-Host "Build Definition ID    : $MatchedBuildDefinitionId"
+        Write-Host "Release Definition     : $DefinitionName"
+        Write-Host "Release Definition ID  : $DefinitionId"
+
+
+        # ====================================================
+        # STEP 6 - GET COMPLETE RELEASE DEFINITION
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 6 - Reading complete Release definition..."
+
+
+        $DefinitionUrl = `
+            "$ReleaseApiBase/definitions/$DefinitionId?api-version=7.1"
+
+
+        $Definition = Invoke-RestMethod `
+            -Uri $DefinitionUrl `
+            -Method GET `
+            -Headers $Headers
+
+
+        if ($null -eq $Definition) {
+
+            throw "Could not retrieve Release Definition $DefinitionId."
+        }
+
+
+        # ====================================================
+        # STEP 7 - BACKUP ORIGINAL DEFINITION
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 7 - Backing up Release definition..."
+
+
+        $SafeDefinitionName = `
+            $DefinitionName -replace '[^a-zA-Z0-9._-]', '_'
+
+
+        $BackupFile = Join-Path `
+            $BackupDirectory `
+            "${DefinitionId}_${SafeDefinitionName}.json"
+
+
+        $Definition |
+            ConvertTo-Json -Depth 100 |
+            Set-Content `
+                -Path $BackupFile `
+                -Encoding UTF8
+
+
+        Write-Host "Backup:"
+        Write-Host "  $BackupFile"
+
+
+        # ====================================================
+        # STEP 8 - FIND DEV ENVIRONMENT
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 8 - Finding DEV environment..."
+
+
+        $DevEnvironments = @(
+
+            $Definition.environments |
+
+                Where-Object {
+                    $_.name -eq $EnvironmentName
+                }
+        )
+
+
+        if ($DevEnvironments.Count -ne 1) {
+
+            throw @"
+Expected exactly one '$EnvironmentName' environment.
+
+Found:
+$($DevEnvironments.Count)
+"@
+        }
+
+
+        $DevEnvironment = $DevEnvironments[0]
+
+        $Result.DevFound = $true
+
+
+        Write-Host "$EnvironmentName environment found."
+
+
+        # ====================================================
+        # STEP 9 - FIND DEV AGENT JOB
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 9 - Finding DEV Agent Job..."
+
+
+        $AgentPhases = @(
+
+            $DevEnvironment.deployPhases |
+
+                Where-Object {
+                    $null -ne $_.workflowTasks
+                }
+        )
+
+
+        if ($AgentPhases.Count -eq 0) {
+
+            throw "No DEV Agent Job containing workflowTasks found."
+        }
+
+
+        if ($AgentPhases.Count -gt 1) {
+
+            throw @"
+More than one DEV Agent Job was found.
+
+This script will NOT guess which one should
+receive the sync task.
+"@
+        }
+
+
+        $AgentPhase = $AgentPhases[0]
+
+
+        $CurrentTasks = @(
+            $AgentPhase.workflowTasks
+        )
+
+
+        Write-Host "DEV Agent Job found."
+        Write-Host "Existing tasks: $($CurrentTasks.Count)"
+
+
+        # ====================================================
+        # STEP 10 - CHECK WHETHER TASK EXISTS
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 10 - Checking existing tasks..."
+
+
+        $ExistingTask = `
+
+            $CurrentTasks |
+
+                Where-Object {
+
+                    $_.name -eq $TaskDisplayName -or
+
+                    (
+                        $null -ne $_.inputs -and
+
+                        $_.inputs.PSObject.Properties.Name -contains
+                        "filePath" -and
+
+                        $_.inputs.filePath -eq
+                        $CentralScriptPath
+                    )
+                } |
+
+                Select-Object -First 1
+
+
+        if ($null -ne $ExistingTask) {
+
+            $Result.ExistingTask = $true
+
+
+            $LastTask = `
+                $CurrentTasks[-1]
+
+
+            if ($LastTask.name -eq $TaskDisplayName) {
+
+                Write-Host "Sync task already exists as LAST DEV task."
+
+
+                $Result.Action = "SKIP"
+                $Result.Status = "Already correct"
+
+
+                $Results += $Result
+
+
+                continue
+            }
+
+
+            throw @"
+Sync task already exists,
+but it is NOT the final DEV task.
+
+Review Release Definition manually:
+
+$DefinitionName
+"@
+        }
+
+
+        # ====================================================
+        # STEP 11 - FIND POWERSHELL V2 TEMPLATE
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 11 - Finding PowerShell v2 template..."
+
+
+        $PowerShellTasks = @(
+
+            $CurrentTasks |
+
+                Where-Object {
+                    $_.taskId -eq $PowerShellTaskId
+                }
+        )
+
+
+        if ($PowerShellTasks.Count -eq 0) {
+
+            throw @"
+No PowerShell v2 task exists in DEV.
+
+Cannot safely create the new task from an existing
+working PowerShell task.
+"@
+        }
+
+
+        # Prefer a File Path PowerShell task.
+        $PowerShellTemplate = `
+
+            $PowerShellTasks |
+
+                Where-Object {
+
+                    $null -ne $_.inputs -and
+
+                    $_.inputs.PSObject.Properties.Name -contains
+                    "targetType" -and
+
+                    $_.inputs.targetType -eq "filePath"
+                } |
+
+                Select-Object -First 1
+
+
+        # If none are File Path, take any PowerShell v2 task.
+        if ($null -eq $PowerShellTemplate) {
+
+            $PowerShellTemplate = `
+                $PowerShellTasks |
+                Select-Object -First 1
+        }
+
+
+        Write-Host "Template task:"
+        Write-Host "  $($PowerShellTemplate.name)"
+
+
+        # ====================================================
+        # STEP 12 - DEEP COPY TEMPLATE
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 12 - Copying PowerShell task structure..."
+
+
+        $TemplateJson = `
+            $PowerShellTemplate |
+            ConvertTo-Json -Depth 50
+
+
+        $NewTask = `
+            $TemplateJson |
+            ConvertFrom-Json
+
+
+        # ====================================================
+        # STEP 13 - CONFIGURE NEW TASK
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 13 - Configuring Sync Dev_Code task..."
+
+
+        Set-ObjectProperty `
+            -Object $NewTask `
+            -Name "name" `
+            -Value $TaskDisplayName
+
+
+        Set-ObjectProperty `
+            -Object $NewTask `
+            -Name "enabled" `
+            -Value $true
+
+
+        Set-ObjectProperty `
+            -Object $NewTask `
+            -Name "alwaysRun" `
+            -Value $false
+
+
+        Set-ObjectProperty `
+            -Object $NewTask `
+            -Name "continueOnError" `
+            -Value $false
+
+
+        Set-ObjectProperty `
+            -Object $NewTask `
+            -Name "timeoutInMinutes" `
+            -Value 0
+
+
+        Set-ObjectProperty `
+            -Object $NewTask `
+            -Name "retryCountOnTaskFailure" `
+            -Value 0
+
+
+        Set-ObjectProperty `
+            -Object $NewTask `
+            -Name "condition" `
+            -Value "succeeded()"
+
+
+        # ----------------------------------------------------
+        # Ensure inputs exists
+        # ----------------------------------------------------
+
+        if ($null -eq $NewTask.inputs) {
+
+            Set-ObjectProperty `
+                -Object $NewTask `
+                -Name "inputs" `
+                -Value ([PSCustomObject]@{})
+        }
+
+
+        # ----------------------------------------------------
+        # FILE PATH MODE
+        # ----------------------------------------------------
+
+        Set-ObjectProperty `
+            -Object $NewTask.inputs `
+            -Name "targetType" `
+            -Value "filePath"
+
+
+        Set-ObjectProperty `
+            -Object $NewTask.inputs `
+            -Name "filePath" `
+            -Value $CentralScriptPath
+
+
+        Set-ObjectProperty `
+            -Object $NewTask.inputs `
+            -Name "arguments" `
+            -Value ""
+
+
+        Set-ObjectProperty `
+            -Object $NewTask.inputs `
+            -Name "workingDirectory" `
+            -Value ""
+
+
+        Set-ObjectProperty `
+            -Object $NewTask.inputs `
+            -Name "errorActionPreference" `
+            -Value "stop"
+
+
+        Set-ObjectProperty `
+            -Object $NewTask.inputs `
+            -Name "failOnStderr" `
+            -Value "false"
+
+
+        Set-ObjectProperty `
+            -Object $NewTask.inputs `
+            -Name "ignoreLASTEXITCODE" `
+            -Value "false"
+
+
+        # Remove copied inline script text if template was inline
+        if (
+            $NewTask.inputs.PSObject.Properties.Name -contains
+            "script"
+        ) {
+
+            $NewTask.inputs.script = ""
+        }
+
+
+        # ====================================================
+        # STEP 14 - SHOW TASK ORDER
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 14 - Current DEV task order:"
+        Write-Host ""
+
+
+        $TaskNumber = 1
+
+
+        foreach ($Task in $CurrentTasks) {
+
+            Write-Host "  $TaskNumber. $($Task.name)"
+
+            $TaskNumber++
+        }
+
+
+        Write-Host ""
+        Write-Host "NEW LAST TASK:"
+        Write-Host ""
+        Write-Host "  $TaskNumber. $TaskDisplayName"
+
+        Write-Host ""
+        Write-Host "Script:"
+        Write-Host "  $CentralScriptPath"
+
+
+        # ====================================================
+        # STEP 15 - APPEND NEW TASK
+        # ====================================================
+
+        $UpdatedTasks = @(
+            $CurrentTasks
+        )
+
+
+        $UpdatedTasks += $NewTask
+
+
+        $AgentPhase.workflowTasks = `
+            $UpdatedTasks
+
+
+        # ====================================================
+        # STEP 16 - DRY RUN
+        # ====================================================
+
+        if ($DryRun) {
+
+            Write-Host ""
+            Write-Host "DRY RUN:"
+            Write-Host "No Release Definition modified."
+
+
+            $Result.Action = "WOULD ADD"
+            $Result.Status = "DRY RUN"
+
+
+            $Results += $Result
+
+
+            continue
+        }
+
+
+        # ====================================================
+        # STEP 17 - SAVE UPDATED RELEASE DEFINITION
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 17 - Saving Release Definition..."
+
+
+        $DefinitionJson = `
+            $Definition |
+            ConvertTo-Json `
+                -Depth 100 `
+                -Compress
+
+
+        $UpdateUrl = `
+            "$ReleaseApiBase/definitions?api-version=7.1"
+
+
+        $UpdateResult = Invoke-RestMethod `
+            -Uri $UpdateUrl `
+            -Method PUT `
+            -Headers $Headers `
+            -Body $DefinitionJson
+
+
+        if ($null -eq $UpdateResult) {
+
+            throw "Azure DevOps returned empty update response."
+        }
+
+
+        # ====================================================
+        # STEP 18 - READ DEFINITION BACK
+        # ====================================================
+
+        Write-Host ""
+        Write-Host "STEP 18 - Reading Release Definition back..."
+
+
+        $VerifiedDefinition = Invoke-RestMethod `
+            -Uri $DefinitionUrl `
+            -Method GET `
+            -Headers $Headers
+
+
+        $VerifiedDev = `
+
+            $VerifiedDefinition.environments |
+
+                Where-Object {
+                    $_.name -eq $EnvironmentName
+                } |
+
+                Select-Object -First 1
+
+
+        if ($null -eq $VerifiedDev) {
+
+            throw "DEV environment missing after update."
+        }
+
+
+        $VerifiedPhases = @(
+
+            $VerifiedDev.deployPhases |
+
+                Where-Object {
+                    $null -ne $_.workflowTasks
+                }
+        )
+
+
+        if ($VerifiedPhases.Count -ne 1) {
+
+            throw "Cannot uniquely verify DEV Agent Job."
+        }
+
+
+        $VerifiedTasks = @(
+            $VerifiedPhases[0].workflowTasks
+        )
+
+
+        # ====================================================
+        # STEP 19 - VERIFY NEW TASK
+        # ====================================================
+
+        $VerifiedTask = `
+
+            $VerifiedTasks |
+
+                Where-Object {
+
+                    $_.name -eq $TaskDisplayName -and
+
+                    $null -ne $_.inputs -and
+
+                    $_.inputs.PSObject.Properties.Name -contains
+                    "filePath" -and
+
+                    $_.inputs.filePath -eq
+                    $CentralScriptPath
+                } |
+
+                Select-Object -First 1
+
+
+        if ($null -eq $VerifiedTask) {
+
+            throw "New Sync Dev_Code task could not be verified."
+        }
+
+
+        # ====================================================
+        # STEP 20 - VERIFY LAST TASK
+        # ====================================================
+
+        $LastTask = `
+            $VerifiedTasks[-1]
+
+
+        if ($LastTask.name -ne $TaskDisplayName) {
+
+            throw "Sync Dev_Code exists but is NOT last."
+        }
+
+
+        # ====================================================
+        # STEP 21 - VERIFY CONTROL OPTIONS
+        # ====================================================
+
+        if ($VerifiedTask.enabled -ne $true) {
+
+            throw "Sync task is disabled."
+        }
+
+
+        if ($VerifiedTask.continueOnError -eq $true) {
+
+            throw "Continue on error is enabled."
+        }
+
+
+        if (
+            $VerifiedTask.condition -and
+            $VerifiedTask.condition -ne "succeeded()"
+        ) {
+
+            throw "Task condition is not succeeded()."
+        }
+
+
+        Write-Host ""
+        Write-Host "======================================================"
+        Write-Host " SUCCESS"
+        Write-Host "======================================================"
+
+        Write-Host "Repository        : $RepoName"
+        Write-Host "Repository ID     : $RepoId"
+        Write-Host "Build Definition  : $MatchedBuildDefinitionId"
+        Write-Host "Release Definition: $DefinitionName"
+        Write-Host "Release ID        : $DefinitionId"
+        Write-Host "DEV Task          : $TaskDisplayName"
+        Write-Host "Position          : LAST"
+
+
+        $Result.Action = "ADDED"
+        $Result.Status = "SUCCESS"
+
+
+        $Results += $Result
+    }
+    catch {
+
+        Write-Host ""
+        Write-Host "ERROR:"
+        Write-Host $_.Exception.Message
+
+
+        $Result.Action = "ERROR"
+        $Result.Status = $_.Exception.Message
+
+
+        $Results += $Result
+
+
+        # Continue processing next repository URL
+        continue
+    }
+}
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+Write-Host ""
+Write-Host ""
+Write-Host "======================================================"
+Write-Host " ROLLOUT SUMMARY"
+Write-Host "======================================================"
+
+
+$Results |
+
+    Format-Table `
+        Repository,
+        RepoId,
+        BuildDefinitionId,
+        ReleaseDefinitionId,
+        DevFound,
+        ExistingTask,
+        Action,
+        Status `
+        -AutoSize
+
+
+Write-Host ""
+Write-Host "Backup directory:"
+Write-Host "  $BackupDirectory"
+Write-Host ""
+
+
+if ($DryRun) {
+
+    Write-Host "======================================================"
+    Write-Host " DRY RUN COMPLETE"
+    Write-Host " NO Release Definitions were modified."
+    Write-Host "======================================================"
+}
+else {
+
+    Write-Host "======================================================"
+    Write-Host " ROLLOUT COMPLETE"
+    Write-Host "======================================================"
+}
